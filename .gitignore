@@ -150,6 +150,9 @@ wandb/
 *.safetensors
 *.parquet
 # Bit-for-bit fixtures are committed on purpose (small, deterministic
-# references the tests compare against); re-admit them past the *.pt rule.
+# references the tests compare against); re-admit them past the *.pt, *.npz,
+# and *.npy rules, at any depth under testdata/.
 !**/testdata/
-!**/testdata/*.pt
+!**/testdata/**/*.pt
+!**/testdata/**/*.npz
+!**/testdata/**/*.npy

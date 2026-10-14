@@ -6,12 +6,14 @@ from torch import nn
 
 import torch
 
+from priml.optimizers.muon import Muon
 from priml.optimizers.parameter_filter import (
     complement,
     everything,
     excluding,
     matching,
     trainable,
+    with_ndim,
 )
 
 
@@ -51,6 +53,25 @@ def test_complement_inverts_its_filter() -> None:
     assert not select("lm_head.weight", _weight())
 
 
+def test_complement_inverts_everything() -> None:
+    parameter = _weight()
+    assert not complement(everything)("block.weight", parameter)
+
+
+def test_excluding_forwards_the_original_name() -> None:
+    parameter = _weight()
+    select = excluding(matching("block"), "head")
+    assert select("block.weight", parameter) is True
+    assert select("head.block", parameter) is False
+    assert select("other.weight", parameter) is False
+
+
+def test_complement_forwards_the_original_parameter() -> None:
+    frozen = nn.Parameter(torch.zeros(2), requires_grad=False)
+    assert complement(trainable)("frozen", frozen) is True
+    assert complement(trainable)("trainable", _weight()) is False
+
+
 def test_filters_compare_by_value_so_configs_can_be_diffed() -> None:
     """A closure never equals another; these do, or forks could not be diffed."""
     assert matching("a", "b") == matching("a", "b")
@@ -72,7 +93,21 @@ def test_filter_reprs_name_functions_without_addresses() -> None:
     assert repr(excluding(trainable, "head")) == "excluding(trainable, 'head')"
 
 
+def test_rank_filter_accepts_one_rank_and_compares_by_value() -> None:
+    select = excluding(Muon.eligible_tensor, "head")
+    rank2 = with_ndim(select, 2)
+    rank3 = with_ndim(select, 3)
+    assert rank2("body", nn.Parameter(torch.zeros(2, 3)))
+    assert not rank2("body", nn.Parameter(torch.zeros(2, 3, 4)))
+    assert rank3("body", nn.Parameter(torch.zeros(2, 3, 4)))
+    assert not rank2("head", nn.Parameter(torch.zeros(2, 3)))
+    assert rank2 == with_ndim(select, 2)
+    assert rank2 != rank3
+    assert hash(rank2) == hash(with_ndim(select, 2))
+    assert "with_ndim" in repr(rank2)
+
+
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

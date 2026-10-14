@@ -7,8 +7,6 @@ from typing import TYPE_CHECKING, Final, cast
 
 import math
 
-from configgle.testing import assert_pprint_golden
-
 import pytest
 import torch
 
@@ -18,6 +16,7 @@ from priml.baselines.tmax.live import LiveTMaxRolloutData
 from priml.baselines.tmax.train_step import _row_metrics
 from priml.math.seed import set_seed_local
 from priml.runtime import MultiProcess, SingleProcess
+from priml.testing.golden import assert_pprint_golden
 from priml.train.activation import SelectiveActivationCheckpointing
 from priml.train.checkpointer import Checkpointer
 from priml.train.parallelism import FullySharded, NoParallel

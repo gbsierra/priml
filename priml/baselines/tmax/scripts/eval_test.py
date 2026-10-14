@@ -408,6 +408,6 @@ def test_server_readiness_rejects_an_exited_process() -> None:
 
 
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

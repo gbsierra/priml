@@ -34,7 +34,7 @@ from priml.baselines.tmax.scoring import (
     LogitModel,
     response_logprobs,
 )
-from priml.model.attention.gated_self_attention import GatedSelfAttention
+from priml.model.attention.gated_attention import GatedAttention
 from priml.model.attention.kernel import SdpaFused
 from priml.model.swiglu import SwiGLU
 from priml.model.transformer.block import TransformerBlock
@@ -95,7 +95,7 @@ def _hf_projection_order(config: Qwen35.Config) -> Qwen35.Config:
 def _cluster_attention(config: Qwen35.Config) -> Qwen35.Config:
     """Score the cluster recipe with fused attention, as the released trainer does.
 
-    ``GatedSelfAttention.Config`` defaults to ``SdpaNaive`` because that is the
+    ``GatedAttention.Config`` defaults to ``SdpaNaive`` because that is the
     only kernel PriML's Hugging Face parity tests can pin: they build the
     reference model with ``attn_implementation="eager"``, and only an unfused
     matmul+softmax produces the same primitive ops (see
@@ -133,7 +133,7 @@ def _cluster_attention(config: Qwen35.Config) -> Qwen35.Config:
     for block in config.block:
         if not isinstance(block, TransformerBlock.Config):
             raise TypeError("Qwen3.5 requires TransformerBlock configs.")
-        if isinstance(block.attn, GatedSelfAttention.Config):
+        if isinstance(block.attn, GatedAttention.Config):
             block.attn.attn_kernel = SdpaFused.Config()
     return config
 
@@ -462,7 +462,11 @@ class TMaxDPPOTrainStep(TrainStep):
                 "size the update with records_per_update, not "
                 "accumulate_grad_batches.",
             )
-        checkpoint = Path(config.model_path) if config.model_path else None
+        checkpoint = (
+            None
+            if config.model_path is None or config.model_path == ""
+            else Path(config.model_path)
+        )
         metadata: dict[str, object] | None = None
         if checkpoint is not None:
             metadata = _checkpoint_metadata(checkpoint)

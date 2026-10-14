@@ -29,7 +29,7 @@ from priml.baselines.tmax.train_step import (
     _update_token_count,
     tiny_qwen35_config,
 )
-from priml.model.attention.gated_self_attention import GatedSelfAttention
+from priml.model.attention.gated_attention import GatedAttention
 from priml.model.attention.kernel import SdpaFused, SdpaNaive
 from priml.model.norm import RMSNorm
 from priml.model.swiglu import SwiGLU
@@ -278,7 +278,7 @@ def test_the_cluster_recipe_fuses_full_attention() -> None:
         block.attn.attn_kernel
         for block in config.block
         if isinstance(block, TransformerBlock.Config)
-        and isinstance(block.attn, GatedSelfAttention.Config)
+        and isinstance(block.attn, GatedAttention.Config)
     ]
     assert kernels, "the fixture must carry a full-attention block"
     assert all(isinstance(kernel, SdpaFused.Config) for kernel in kernels)
@@ -290,7 +290,7 @@ def test_the_eager_parity_paths_keep_the_naive_kernel() -> None:
     assert isinstance(config.block, list)
     for block in config.block:
         assert isinstance(block, TransformerBlock.Config)
-        if isinstance(block.attn, GatedSelfAttention.Config):
+        if isinstance(block.attn, GatedAttention.Config):
             assert isinstance(block.attn.attn_kernel, SdpaNaive.Config)
 
 
@@ -318,7 +318,7 @@ def test_a_staged_checkpoint_scores_on_the_fused_kernel(
     kernels = [
         module.attn_kernel
         for module in step.model.modules()
-        if isinstance(module, GatedSelfAttention)
+        if isinstance(module, GatedAttention)
     ]
     assert kernels, "the fixture must build a full-attention block"
     assert all(isinstance(kernel, SdpaFused) for kernel in kernels)

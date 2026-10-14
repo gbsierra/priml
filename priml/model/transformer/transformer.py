@@ -30,6 +30,7 @@ from priml.model.custom_types import (
     ChannelsOut,
     HasDepthIndex,
     HasResetParameters,
+    LayerCache,
     TensorModule,
     propagate_attr,
 )
@@ -253,14 +254,21 @@ class Transformer(nn.Module):
         return self.proj_out(hidden, **kwargs)
 
     @override
-    def forward(self, x: Tensor, /, **kwargs: object) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        /,
+        *,
+        cache: LayerCache | None = None,
+        **kwargs: object,
+    ) -> Tensor:
         """Apply input projection, blocks, and head."""
         output_projection = kwargs.pop("output_projection", None)
         self._validate_output_projection(output_projection)
         if self.proj_in is not None:
             x = self.proj_in(x)
         for block in self.blocks:
-            x = cast(Tensor, block(x, **kwargs))
+            x = cast(Tensor, block(x, cache=cache, **kwargs))
         return self.project_to_logits(
             x,
             output_projection=cast("OutputProjection | None", output_projection),

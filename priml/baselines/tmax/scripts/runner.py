@@ -515,7 +515,7 @@ def _checkpoint_inventory(
 def _require_checkpoint_on_ray_nodes(checkpoint: Path, ray: object) -> None:
     """Fail before engine creation unless every live Ray node sees the checkpoint."""
     expected = _checkpoint_inventory(str(checkpoint))
-    if not expected:
+    if expected is None or not expected:
         raise FileNotFoundError(
             f"TMax checkpoint is missing or empty on the driver: {checkpoint}.",
         )

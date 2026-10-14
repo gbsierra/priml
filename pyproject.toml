@@ -3,7 +3,7 @@
 
 [project]
 name = "priml"
-version = "0.1.4"
+version = "0.1.6"
 description = "Malleable ML building blocks for training experiments."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -22,6 +22,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
+    "treekle>=0.1.0",
     # torch
     "torch==2.11.0",
     "torchao==0.17.0",
@@ -47,6 +48,13 @@ dependencies = [
     # analysis
     "numpy>=2.1",
     "scipy",
+    # ConvexTok's presolver and Craftax's CPU env; Craftax's Numba intrinsics
+    # build LLVM IR with llvmlite directly.
+    "numba>=0.67",
+    "llvmlite",
+    # Craftax's world-model archives. The stdlib `compression.zstd` is
+    # 3.14-only; the package validates on 3.12.
+    "zstandard>=0.25.0",
     # nlp
     "rustbpe>=0.1.0",
     "tiktoken>=0.12.0",
@@ -60,8 +68,9 @@ dependencies = [
     # tensor utilities
     "einops",
     "einshape",
-    # config
-    "configgle>=1.3.7",
+    # config; 1.4.1 first ships LateBound and Fig.finalized(), which priml imports,
+    # and 1.4.2 the pformat layout every baseline's config golden is minted in
+    "configgle>=1.4.2",
     # containers
     "wrapt",
     # misc
@@ -164,7 +173,6 @@ markers = [
     "cuda: tests that require a real CUDA device (skipped in hosted CI)",
     "integration: tests that require networking or external deps (deselected by default)",
     "performance: timing-sensitive tests (deselected by default)",
-    "real_llm: integration tests that spawn a live LLM CLI (claude/codex); skipped unless RUN_REAL_LLM=1 is set",
     "slow: expensive local correctness test (JIT, training, full fixtures, git, bash, or a fresh interpreter); excluded from the fast unit tier and run by the pre-push slow gate",
     # Actual annotations.
     "bench_compile_time: asserts a compile-time budget or comparison",
@@ -175,8 +183,7 @@ markers = [
     "browser_chrome: drives a local Chrome/Chromium browser",
     "browser_zendriver: drives the zendriver browser backend",
     "cli_bash: shells out to bash",
-    "cli_claude: shells out to the Claude CLI; skipped unless RUN_REAL_LLM=1",
-    "cli_codex: shells out to the Codex CLI; skipped unless RUN_REAL_LLM=1",
+    "cli_real_llm: spawns a live LLM CLI (claude, codex); skipped unless RUN_REAL_LLM=1",
     "cli_docker: shells out to Docker",
     "cli_git: shells out to git or requires a real git repository",
     "cli_node: shells out to node/npm tooling",
@@ -202,6 +209,7 @@ markers = [
     "gpu_triton: requires Triton kernels",
     "network_anthropic: reaches Anthropic over the network",
     "network_duckduckgo: reaches DuckDuckGo over the network",
+    "network_e2b: reaches E2B over the network",
     "network_gemini: reaches Gemini over the network",
     "network_google_search: reaches Google Search over the network",
     "network_github: reaches GitHub over the network",
@@ -213,12 +221,12 @@ markers = [
     "network_openreview: reaches OpenReview over the network",
     "network_pypi: reaches PyPI over the network",
     "network_searxng: reaches a SearXNG service over the network",
-    "network_shadeform: reaches Shadeform over the network",
+    "network_gpu_cloud: reaches a GPU cloud provider over the network",
     "network_slack: reaches Slack over the network",
     "network_together: reaches Together over the network",
     "network_wandb: reaches Weights & Biases over the network",
 ]
-addopts = "-m 'not ci_smoke and not cuda and not integration and not performance and not cluster and not slow' --durations=20 --dist=worksteal"
+addopts = "-m 'not ci_smoke and not cuda and not integration and not performance and not cluster and not slow' --durations=20 --dist=worksteal -p no:py_pglite"
 timeout = 60
 # "error" = treat all warnings as errors (same as -Werror).
 # Using filterwarnings instead of addopts so we can add exceptions.
@@ -251,9 +259,30 @@ norecursedirs = [
     "__pycache__",
     "third_party",
     "typings",
+    # Copied tests require mutmut trampolines and must not join normal collection.
+    "mutants",
+]
+
+[tool.mutmut]
+# Uncovered lines cannot produce assertion failures; measure them with coverage.
+mutate_only_covered_lines = true
+source_paths = ["."]
+pytest_add_cli_args = ["-p", "no:jaxtyping"]
+# Argparse help presentation has no behavior, so a mutant there is unkillable by
+# a correct test. Mutmut skips whole lines: match only lines holding nothing but
+# that keyword, so a sibling such as `nargs="*"` on a shared line still mutates.
+do_not_mutate_patterns = [
+    '^\s*help=("[^"]*"\s*)+,?\s*$',
+    '^\s*(description|formatter_class)=[\w.]+,?\s*$',
 ]
 
 [tool.coverage.run]
+# sys.monitoring, the default from Python 3.14 on. 3.12's default, ctrace,
+# traces every line a test runs, Numba's pure-Python compiler included: a cold
+# compile of priml's Craftax kernels took 68 s under it, 49 s under sysmon and
+# 43 s untraced, past the 60 s test timeout. COVERAGE_CORE still overrides it,
+# as the testmon hooks' ctrace does.
+core = "sysmon"
 omit = [
     "*_test.py",
     "test_*.py",
@@ -275,6 +304,11 @@ exclude_lines = [
     # tracer cannot see lines a GPU test executed; the kernel is tested by
     # its ``gpu_triton`` caller, not by line coverage.
     "^def \\w+_triton\\(",
+    # Convention: a ``_numba``-suffixed def is a body Numba compiles from
+    # its bytecode to machine code. The Python bytecode never runs, so the
+    # tracer cannot see lines a test executed; the kernel is tested by its
+    # callers' results, not by line coverage.
+    "^def \\w+_numba\\(",
 ]
 fail_under = 95
 show_missing = true
@@ -306,13 +340,16 @@ extend-safe-fixes = [
     "C4",     # Collection and comprehension rewrites.
     "E711",   # Compare to None with identity.
     "E712",   # Compare booleans by truthiness.
+    "E731",   # Do not assign a `lambda` expression, use a `def`.
     "F401",   # Remove unused imports.
     "F601",   # Remove overwritten dictionary entries.
     "F841",   # Remove unused local bindings.
     "PT006",  # Use tuple for pytest.mark.parametrize names.
     "PT007",  # Use tuple/list consistently for pytest values.
+    "PT018",  # Split composite assertions.
     "PYI034", # Annotate __enter__/__new__/__iadd__ returns as Self.
     "RET504", # Remove unnecessary local assignment directly before return.
+    "RUF007", # Prefer `itertools.pairwise()` over `zip()` when iterating over successive pairs.
     "SIM102", # Collapse nested if statements.
     "SIM105", # Use contextlib.suppress instead of try-except-pass.
     "TC",     # Type-checking import and annotation rewrites.
@@ -494,7 +531,7 @@ ignore = [
 # runtime-evaluated-*: never move an import USED IN annotations of these.
 #   - pydantic.BaseModel: validates fields from annotations.
 #   - configgle Fig/Makes/Maker: resolves Config fields and owner __init__ hints.
-#   - dataclasses.dataclass: custom_json.to_json, cli_override, and
+#   - dataclasses.dataclass: codec.from_plain, cli_override, and
 #     tool_spec.coerce_kwargs call get_type_hints on any dataclass. This pins
 #     every dataclass field type eager; a heavy one (torch.Tensor) that the
 #     house `annotation-import` rule then flags takes an inline house-ignore.
@@ -562,6 +599,12 @@ useLibraryCodeForTypes = false
 # `stubPath` (not `extraPaths`) is the one root that resolves ahead of an
 # installed package's inline types.
 stubPath = "typings"
+# typings/ is ALSO a source root so a stub package can ship a placeholder .py:
+# triton is linux-only (uv.lock `sys_platform == 'linux'`), so without this
+# every `import triton` fails `reportMissingModuleSource` on macOS, and an inline
+# suppression would fail `reportUnnecessaryTypeIgnoreComment` on linux. Stubs
+# still win over source, so no type changes. Mirrors [tool.ty.environment].
+extraPaths = ["typings"]
 # `rekursiv-ai-typeshed` (a `typecheck` dependency): the checkers' bundled stdlib
 # with `int`/`float` `__pow__` returning `float` rather than typeshed's `Any`,
 # which would otherwise make every `x ** 0.5` a `reportAny` violation.
@@ -712,6 +755,7 @@ url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 [tool.uv.sources]
+treekle = { git = "https://github.com/rekursiv-ai/treekle", branch = "main" }
 rekursiv-ai-typeshed = { path = "packages/rekursiv-ai-typeshed" }
 # Pin at cu128 for providers that don't keep their drivers up-to-date.
 # To test that it installed correctly,
