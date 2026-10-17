@@ -39,7 +39,8 @@ results. Direct unit tests cover ``mask_logprobs`` and ``masked_mean``.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Final, Literal
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Final
 
 import torch
 
@@ -48,12 +49,11 @@ if TYPE_CHECKING:
     from torch import Tensor
 
 
-DivergenceType = Literal["tv", "kl"]
-"""How DPPO measures change in a sampled token's probability.
+type BinaryDivergenceFn = Callable[[Tensor, Tensor], Tensor]
+"""Map ``(rollout, policy)`` sampled-token probabilities to a divergence.
 
-``"tv"`` uses the absolute probability difference. ``"kl"`` uses Bernoulli
-KL divergence, which also accounts for the direction of the change. The
-released TMax 4B recipe uses ``"tv"``.
+:func:`binary_total_variation` is the released TMax 4B recipe's choice;
+:func:`binary_kl` also accounts for the direction of the change.
 """
 
 
@@ -115,12 +115,44 @@ def importance_ratio(new_logprobs: Tensor, behavior_logprobs: Tensor) -> Tensor:
     return torch.exp(new_logprobs - behavior_logprobs)
 
 
+def binary_total_variation(rollout: Tensor, policy: Tensor) -> Tensor:
+    """Return the sampled token's absolute probability change, Eq. 13.
+
+    Args:
+      rollout: Generating model's probability of each sampled token.
+      policy: Current model's probability of the same tokens.
+
+    Returns:
+      divergence: ``|rollout - policy|`` per token.
+
+    """
+    return (rollout - policy).abs()
+
+
+def binary_kl(rollout: Tensor, policy: Tensor) -> Tensor:
+    """Return the Bernoulli KL between sampled-token probabilities, Eq. 14.
+
+    Args:
+      rollout: Generating model's probability of each sampled token.
+      policy: Current model's probability of the same tokens.
+
+    Returns:
+      divergence: ``KL(Bernoulli(rollout) || Bernoulli(policy))`` per token.
+
+    """
+    rollout = rollout.clamp(_BERNOULLI_EPS, 1.0 - _BERNOULLI_EPS)
+    policy = policy.clamp(_BERNOULLI_EPS, 1.0 - _BERNOULLI_EPS)
+    return rollout * (rollout.log() - policy.log()) + (1.0 - rollout) * (
+        (1.0 - rollout).log() - (1.0 - policy).log()
+    )
+
+
 def binary_divergence(
     *,
     behavior_logprobs: Tensor,
     policy_logprobs: Tensor,
     response_mask: Tensor,
-    divergence_type: DivergenceType = "tv",
+    divergence_fn: BinaryDivergenceFn = binary_total_variation,
 ) -> Tensor:
     """Measure how different the generating and current models are.
 
@@ -132,30 +164,16 @@ def binary_divergence(
       behavior_logprobs: Saved log probabilities from response generation.
       policy_logprobs: Current model's log probabilities for the same tokens.
       response_mask: True for response tokens the model sampled.
-      divergence_type: ``"tv"`` for absolute probability difference or
-        ``"kl"`` for the log-based KL measure.
+      divergence_fn: Divergence between the two sampled-token probabilities.
 
     Returns:
       divergence: Difference per token, with zero at excluded positions.
 
-    Raises:
-      ValueError: ``divergence_type`` is neither ``"tv"`` nor ``"kl"``.
-
     """
-    rollout = torch.exp(behavior_logprobs.clamp(min=_LOGPROB_FLOOR, max=0.0))
-    policy = torch.exp(policy_logprobs.clamp(min=_LOGPROB_FLOOR, max=0.0))
-    if divergence_type == "tv":
-        divergence = (rollout - policy).abs()
-    elif divergence_type == "kl":
-        rollout_clip = rollout.clamp(_BERNOULLI_EPS, 1.0 - _BERNOULLI_EPS)
-        policy_clip = policy.clamp(_BERNOULLI_EPS, 1.0 - _BERNOULLI_EPS)
-        divergence = rollout_clip * (rollout_clip.log() - policy_clip.log()) + (
-            1.0 - rollout_clip
-        ) * ((1.0 - rollout_clip).log() - (1.0 - policy_clip).log())
-    else:
-        raise ValueError(  # pyright: ignore[reportUnreachable] -- Literal-typed config can still carry any string at runtime.
-            f"Unknown DPPO divergence type: {divergence_type!r}.",
-        )
+    divergence = divergence_fn(
+        torch.exp(behavior_logprobs.clamp(min=_LOGPROB_FLOOR, max=0.0)),
+        torch.exp(policy_logprobs.clamp(min=_LOGPROB_FLOOR, max=0.0)),
+    )
     return torch.where(response_mask, divergence, torch.zeros_like(divergence))
 
 
@@ -167,7 +185,7 @@ def dppo_mask(
     ratio: Tensor,
     response_mask: Tensor,
     divergence_threshold: float,
-    divergence_type: DivergenceType = "tv",
+    divergence_fn: BinaryDivergenceFn = binary_total_variation,
 ) -> tuple[Tensor, Tensor]:
     """Choose which tokens may affect training.
 
@@ -184,7 +202,7 @@ def dppo_mask(
       ratio: Output of :func:`importance_ratio`.
       response_mask: True for response tokens the model sampled.
       divergence_threshold: Largest allowed model difference; TMax uses ``0.1``.
-      divergence_type: Passed to :func:`binary_divergence`.
+      divergence_fn: Passed to :func:`binary_divergence`.
 
     Returns:
       mask: ``1.0`` where a token may train and ``0.0`` where it is blocked.
@@ -196,7 +214,7 @@ def dppo_mask(
             behavior_logprobs=behavior_logprobs,
             policy_logprobs=new_logprobs,
             response_mask=response_mask,
-            divergence_type=divergence_type,
+            divergence_fn=divergence_fn,
         )
         outside = divergence > divergence_threshold
         pushing_out = ((advantages > 0) & (ratio > 1.0)) | (

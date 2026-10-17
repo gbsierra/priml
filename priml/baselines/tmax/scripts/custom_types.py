@@ -159,6 +159,11 @@ class HasRuntimeEnv(Protocol):
 class PromptLoader(Protocol):
     """TMax's resumable prompt iterator."""
 
+    @property
+    def _epoch(self) -> int:
+        """Return the pass number; upstream tags each queued prompt with it."""
+        ...
+
     def __next__(self) -> object:
         """Return the next prompt example."""
         ...
@@ -336,6 +341,28 @@ class ModelUtilsModule(Protocol):
     """``open_instruct.model_utils``."""
 
     ModelConfig: Callable[..., object]
+
+
+class RlUtilsModule(Protocol):
+    """``open_instruct.rl_utils``."""
+
+    def _get_request_info_for_sample(
+        self,
+        request_info: object,
+        index: int,
+        /,
+    ) -> Mapping[str, object] | None:
+        """Return one sample's request metadata, as upstream's writer reads it."""
+        ...
+
+
+class ActorManagerModule(Protocol):
+    """``open_instruct.actor_manager``."""
+
+    @property
+    def ActorManager(self) -> object:  # noqa: N802 -- Upstream's class name.
+        """Return the actor class Ray wraps."""
+        ...
 
 
 class ModelDimsReader(Protocol):

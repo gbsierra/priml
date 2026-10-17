@@ -70,7 +70,7 @@ def test_live_loader_syncs_between_updates(
         num_samples_per_prompt=2,
         runner=runner,
     )
-    data = cast(LiveTMaxRolloutData, config.make())
+    data = config.make()
     step = SimpleNamespace(pad_token_id=0, global_step=0)
     data.bind_step(cast("TrainStepProtocol", step))
     events: list[str] = []
@@ -114,15 +114,12 @@ def test_live_loader_does_not_sync_for_replayed_steps(
 ) -> None:
     # Replayed steps skip the sync; only fresh collection resyncs.
     runner = RunnerConfig(num_updates=2, num_prompts=1, samples_per_prompt=2)
-    data = cast(
-        LiveTMaxRolloutData,
-        LiveTMaxRolloutData.Config(
-            working_dir="/unused",
-            records_per_update=2,
-            num_samples_per_prompt=2,
-            runner=runner,
-        ).make(),
-    )
+    data = LiveTMaxRolloutData.Config(
+        working_dir="/unused",
+        records_per_update=2,
+        num_samples_per_prompt=2,
+        runner=runner,
+    ).make()
     step = SimpleNamespace(pad_token_id=0, global_step=0)
     data.bind_step(cast("TrainStepProtocol", step))
     events: list[str] = []
@@ -182,7 +179,7 @@ def test_live_resume_rejects_a_cursor_that_disagrees_with_the_learner() -> None:
         num_samples_per_prompt=2,
         runner=RunnerConfig(num_updates=1, num_prompts=1, samples_per_prompt=2),
     )
-    data = cast(LiveTMaxRolloutData, config.make())
+    data = config.make()
     data.bind_step(
         cast(
             "TrainStepProtocol",
@@ -202,7 +199,7 @@ def test_live_runtime_rejects_a_different_prompt_group_size() -> None:
         num_samples_per_prompt=2,
         runner=RunnerConfig(num_updates=1, num_prompts=1, samples_per_prompt=4),
     )
-    data = cast(LiveTMaxRolloutData, config.make())
+    data = config.make()
     data.bind_step(
         cast(
             "TrainStepProtocol",
@@ -319,7 +316,7 @@ def test_live_runtime_primes_prompts_after_the_weight_sync(
         num_samples_per_prompt=2,
         runner=runner,
     )
-    data = cast(LiveTMaxRolloutData, config.make())
+    data = config.make()
     data.bind_step(
         cast(
             "TrainStepProtocol",
@@ -350,15 +347,12 @@ def test_live_runtime_primes_prompts_after_the_weight_sync(
 def test_live_checkpoint_state_is_side_effect_free() -> None:
     # Checkpointing replays captured state and never queries the live loader.
     calls: list[str] = []
-    data = cast(
-        LiveTMaxRolloutData,
-        LiveTMaxRolloutData.Config(
-            working_dir="/unused",
-            records_per_update=2,
-            num_samples_per_prompt=2,
-            runner=RunnerConfig(num_updates=1, num_prompts=1, samples_per_prompt=2),
-        ).make(),
-    )
+    data = LiveTMaxRolloutData.Config(
+        working_dir="/unused",
+        records_per_update=2,
+        num_samples_per_prompt=2,
+        runner=RunnerConfig(num_updates=1, num_prompts=1, samples_per_prompt=2),
+    ).make()
     data._session = cast(
         CollectionSession,
         cast(
@@ -379,15 +373,12 @@ def test_live_replays_committed_step_without_priming(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Replaying a committed step reads the shard; no prompts are queued.
-    data = cast(
-        LiveTMaxRolloutData,
-        LiveTMaxRolloutData.Config(
-            working_dir="/unused",
-            records_per_update=2,
-            num_samples_per_prompt=2,
-            runner=RunnerConfig(num_updates=2, num_prompts=1, samples_per_prompt=2),
-        ).make(),
-    )
+    data = LiveTMaxRolloutData.Config(
+        working_dir="/unused",
+        records_per_update=2,
+        num_samples_per_prompt=2,
+        runner=RunnerConfig(num_updates=2, num_prompts=1, samples_per_prompt=2),
+    ).make()
     data._next_step = 0
     data._first_missing_step = 1
     data._session = cast(CollectionSession, cast(object, SimpleNamespace()))
@@ -428,15 +419,12 @@ def test_live_primes_once_and_commits_captured_cursor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Prompts prime once, and each update commits the loader cursor it ended on.
-    data = cast(
-        LiveTMaxRolloutData,
-        LiveTMaxRolloutData.Config(
-            working_dir="/unused",
-            records_per_update=2,
-            num_samples_per_prompt=2,
-            runner=RunnerConfig(num_updates=2, num_prompts=1, samples_per_prompt=2),
-        ).make(),
-    )
+    data = LiveTMaxRolloutData.Config(
+        working_dir="/unused",
+        records_per_update=2,
+        num_samples_per_prompt=2,
+        runner=RunnerConfig(num_updates=2, num_prompts=1, samples_per_prompt=2),
+    ).make()
     positions = iter(({"position": 1}, {"position": 2}))
     data._session = cast(
         CollectionSession,

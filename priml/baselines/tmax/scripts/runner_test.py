@@ -13,6 +13,7 @@ import json
 import os
 
 from torch import Tensor
+from treekle import json_loads
 
 import numpy as np
 import pytest
@@ -151,8 +152,9 @@ class _FakeUpstream:
 class _FakeLoader:
     """A prompt loader over a fixed list of examples."""
 
-    def __init__(self, examples: Iterable[object] = ()) -> None:
+    def __init__(self, examples: Iterable[object] = (), *, epoch: int = 0) -> None:
         self._examples: Iterator[object] = iter(examples)
+        self._epoch = epoch
 
     def __next__(self) -> object:
         return next(self._examples)
@@ -509,6 +511,18 @@ def _request_info(request_info: object, index: int) -> dict[str, object]:
     return {"sample": index}
 
 
+class _RlUtils:
+    """``rl_utils``: the released writer's per-sample request-info reader."""
+
+    def _get_request_info_for_sample(
+        self,
+        request_info: object,
+        index: int,
+        /,
+    ) -> dict[str, object]:
+        return _request_info(request_info, index)
+
+
 def _api(
     *,
     ray: _FakeRay | None = None,
@@ -516,8 +530,6 @@ def _api(
     weight_transfer: tuple[_FakeTransferBase, _FakeTransferNccl] | None = None,
 ) -> UpstreamApi:
     """Build an upstream-shaped fake without importing Ray."""
-    rl = ModuleType("rl")
-    vars(rl)["_get_request_info_for_sample"] = _request_info
     fake = upstream_modules or _FakeUpstream()
     return UpstreamApi(
         ray=ray or _FakeRay(),
@@ -529,7 +541,7 @@ def _api(
         grpo_utils=fake,
         ground_truth_utils=fake,
         model_utils=fake,
-        rl_utils=rl,
+        rl_utils=_RlUtils(),
         utils=fake,
         vllm_utils=fake,
         weight_transfer=weight_transfer,
@@ -679,7 +691,7 @@ def test_fixed_collection_recovers_an_incomplete_final_update(
 
     assert calls == [1]
     records = [
-        cast("dict[str, object]", json.loads(line))
+        json_loads(line, dict[str, object])
         for line in (tmp_path / "mock_rollouts_000000.jsonl")
         .read_text(encoding="utf-8")
         .splitlines()
@@ -797,13 +809,11 @@ def test_live_writer_atomically_commits_records_and_cursor(
     resumed = RolloutWriter(tmp_path, "mock")
     assert resumed.committed_live_steps(2) == {4}
     assert resumed.live_cursor_after(4, 2) == {"position": 9}
-    marker = cast(
-        "dict[str, object]",
-        json.loads(
-            (tmp_path / "mock_live_step_00000004.json").read_text(
-                encoding="utf-8",
-            ),
+    marker = json_loads(
+        (tmp_path / "mock_live_step_00000004.json").read_text(
+            encoding="utf-8",
         ),
+        dict[str, object],
     )
     digest = marker["records_sha256"]
     assert isinstance(digest, str)
@@ -914,7 +924,7 @@ def test_live_writer_rejects_same_index_content_tampering(tmp_path: Path) -> Non
     )
     shard = tmp_path / "mock_rollouts_000000.jsonl"
     records = [
-        cast("dict[str, object]", json.loads(line))
+        json_loads(line, dict[str, object])
         for line in shard.read_text(encoding="utf-8").splitlines()
     ]
     records[1]["reward"] = -1.0

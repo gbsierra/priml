@@ -3,37 +3,35 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, cast
+from typing import Final, cast
 
 import json
+
+from treekle import json_loads
 
 import pytest
 import torch
 
 from priml.baselines.tmax.rollouts import (
     RolloutRecord,
+    centered_advantages,
     group_advantages,
+    maxrl_advantages,
     pack_rollouts,
     read_rollout_records,
+    standard_advantages,
 )
 
 
 _CWD: Final = Path(__file__).resolve().parent
-
-if TYPE_CHECKING:
-    from priml.baselines.tmax.rollouts import AdvantageNormalization
-
-
 ROOT = _CWD
 
 
 def _published_payload() -> dict[str, object]:
     """Return the first released rollout record, decoded."""
-    return cast(
+    return json_loads(
+        (ROOT / "testdata" / "recorded_rollout.jsonl").read_text().splitlines()[0],
         dict[str, object],
-        json.loads(
-            (ROOT / "testdata" / "recorded_rollout.jsonl").read_text().splitlines()[0],
-        ),
     )
 
 
@@ -64,11 +62,8 @@ def _record(*, mask: tuple[int, ...] | None = (1, 0)) -> RolloutRecord:
 
 def test_group_advantages_matches_the_recorded_advantage_fixture() -> None:
     """Centered advantages reproduce the published fixture exactly."""
-    payload = cast(
-        dict[str, object],
-        json.loads(
-            (ROOT / "testdata" / "recorded_advantages.json").read_text(),
-        ),
+    payload = json_loads(
+        (ROOT / "testdata" / "recorded_advantages.json").read_text(), dict[str, object]
     )
     groups = cast(list[dict[str, object]], payload["groups"])
     group = groups[0]
@@ -78,7 +73,7 @@ def test_group_advantages_matches_the_recorded_advantage_fixture() -> None:
             int,
             payload["num_samples_per_prompt_rollout"],
         ),
-        normalization="centered",
+        advantage_fn=centered_advantages,
     )
     torch.testing.assert_close(actual, torch.tensor(group["advantage"]))
 
@@ -252,9 +247,9 @@ def test_group_advantages_rejects_a_partial_group() -> None:
 def test_group_advantages_standard_normalization_divides_by_the_spread() -> None:
     """Standard normalization centers rewards and divides by their spread."""
     advantages = group_advantages(
-        [0.0, 2.0],
+        [0.0, 4.0],
         num_samples_per_prompt=2,
-        normalization="standard",
+        advantage_fn=standard_advantages,
     )
     torch.testing.assert_close(advantages, torch.tensor([-1.0, 1.0]))
 
@@ -264,24 +259,22 @@ def test_group_advantages_maxrl_normalizes_only_a_positive_group() -> None:
     advantages = group_advantages(
         [0.0, 2.0, -1.0, -3.0],
         num_samples_per_prompt=2,
-        normalization="maxrl",
+        advantage_fn=maxrl_advantages,
     )
     torch.testing.assert_close(advantages, torch.tensor([-1.0, 1.0, 0.0, 0.0]))
 
 
-def test_group_advantages_rejects_an_unknown_normalization() -> None:
-    """Reject advantage normalization modes not published by TMax."""
-
-    def invalid_normalization() -> str:
-        """Return a value outside the typed normalization choices."""
-        return "not-a-normalization"
-
-    with pytest.raises(ValueError, match="Invalid advantage normalization"):
-        group_advantages(
-            [1.0],
-            num_samples_per_prompt=1,
-            normalization=cast("AdvantageNormalization", invalid_normalization()),
-        )
+def test_group_advantages_applies_the_injected_baseline_per_group() -> None:
+    """The baseline sees ``[groups, samples]`` and its output is flattened."""
+    advantages = group_advantages(
+        [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        num_samples_per_prompt=3,
+        advantage_fn=lambda grouped: grouped - grouped[:, :1],
+    )
+    torch.testing.assert_close(
+        advantages,
+        torch.tensor([0.0, 1.0, 2.0, 0.0, 1.0, 2.0]),
+    )
 
 
 def test_packing_rejects_a_mismatched_advantage_count() -> None:

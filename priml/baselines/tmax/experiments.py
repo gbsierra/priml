@@ -8,11 +8,9 @@ from __future__ import annotations
 
 from dataclasses import field
 from pathlib import Path
-from typing import Final, Self, override
+from typing import TYPE_CHECKING, Final, Self, override
 
 from configgle import Makes
-
-import torch
 
 from priml.baselines.tmax.data import TMaxRolloutData
 from priml.baselines.tmax.live import LiveTMaxRolloutData
@@ -33,86 +31,83 @@ from priml.train.parallelism import FullySharded, NoParallel
 from priml.train.train_loop import TrainLoop
 
 
+if TYPE_CHECKING:
+    import torch
+else:
+    from wrapt import lazy_import
+
+    # ~1050 ms; only ``exp000`` reaches it.
+    torch = lazy_import("torch")
+
+
 _CWD: Final = Path(__file__).resolve().parent
 
 
-class TMaxTrainLoop(
-    Makes["TrainLoop"],
-    TrainLoop.Config[TMaxDPPOTrainStep.Config, TMaxRolloutData.Config],
-):
-    """Configure PriML training with TMax rollout data."""
+class TMaxTrainLoop(TrainLoop):
+    """A training loop that refuses learner and live-runner settings that disagree."""
 
-    step: TMaxDPPOTrainStep.Config = field(
-        default_factory=TMaxDPPOTrainStep.Config,
-    )
-    """Qwen3.5 model and DPPO objective."""
+    class Config(
+        Makes["TMaxTrainLoop"],
+        TrainLoop.Config[TMaxDPPOTrainStep.Config, TMaxRolloutData.Config],
+    ):
+        """Configure PriML training with TMax rollout data."""
 
-    dataset: TMaxRolloutData.Config = field(
-        default_factory=TMaxRolloutData.Config,
-    )
-    """TMax rollouts and packed training rows."""
+        step: TMaxDPPOTrainStep.Config = field(
+            default_factory=TMaxDPPOTrainStep.Config,
+        )
+        """Qwen3.5 model and DPPO objective."""
 
-    @override
-    def finalize(self) -> Self:
-        """Share run settings with the live rollout runner."""
-        if isinstance(self.working_dir, str):
-            run_working_dir: Path | str = self.working_dir.format(
-                study_name=self.study_name,
-                experiment_name=self.experiment_name,
-            )
-        else:
-            run_working_dir = self.working_dir
-        run_dir = resolve_working_dir(self.base_dir, run_working_dir)
-        model_path = self.step.model_path
-        if model_path is not None:
-            self.step.model_path = resolve_working_dir(self.base_dir, model_path)
-        if self.step.pad_token_id is not None:
-            if self.dataset.pad_token_id not in (None, self.step.pad_token_id):
-                raise ValueError(
-                    "dataset.pad_token_id must match step.pad_token_id.",
+        dataset: TMaxRolloutData.Config = field(
+            default_factory=TMaxRolloutData.Config,
+        )
+        """TMax rollouts and packed training rows."""
+
+        @override
+        def finalize(self) -> Self:
+            """Share run settings with the live rollout runner."""
+            if isinstance(self.working_dir, str):
+                run_working_dir: Path | str = self.working_dir.format(
+                    study_name=self.study_name,
+                    experiment_name=self.experiment_name,
                 )
-            self.dataset.pad_token_id = self.step.pad_token_id
-        if isinstance(self.dataset, LiveTMaxRolloutData.Config):
-            runner = self.dataset.runner
-            if model_path is None:
-                raise ValueError("Live TMax requires step.model_path.")
-            if self.dataset.base_dir not in (None, run_dir):
-                raise ValueError(
-                    "Live TMax dataset.base_dir must inherit the experiment "
-                    "working directory.",
-                )
-            self.dataset.base_dir = run_dir
-            if runner.base_dir is None:
-                runner.base_dir = self.base_dir
-            runner.working_dir = run_working_dir
-            runner.checkpoint = Path(model_path)
-            runner.output_dir = Path(self.dataset.working_dir)
-            if not isinstance(self.step.train_budget_steps, int):
-                raise TypeError(
-                    "Live TMax requires an integer step.train_budget_steps.",
-                )
-            runner.num_updates = self.step.train_budget_steps
-            if self.seed is None:
-                raise ValueError("Live TMax requires an explicit seed.")
-            runner.seed = self.seed
-            runner.temperature = self.step.temperature
-            runner.lm_head_fp32 = self.step.fp32_head
-            self.dataset.records_per_update = runner.records_per_update
-            self.dataset.num_samples_per_prompt = runner.samples_per_prompt
-            if self.dataset.active_sampling != runner.active_sampling:
-                raise ValueError(
-                    "Live TMax dataset.active_sampling must match "
-                    "dataset.runner.active_sampling.",
-                )
-            if self.dataset.filter_zero_std_samples != runner.filter_zero_std_samples:
-                raise ValueError(
-                    "Live TMax dataset.filter_zero_std_samples must match "
-                    "dataset.runner.filter_zero_std_samples.",
-                )
-        return super().finalize()
+            else:
+                run_working_dir = self.working_dir
+            model_path = self.step.model_path
+            if model_path is not None:
+                self.step.model_path = resolve_working_dir(self.base_dir, model_path)
+            if self.dataset.pad_token_id is None:
+                self.dataset.pad_token_id = self.step.pad_token_id
+            if isinstance(self.dataset, LiveTMaxRolloutData.Config):
+                runner = self.dataset.runner
+                if self.dataset.base_dir is None:
+                    self.dataset.base_dir = resolve_working_dir(
+                        self.base_dir,
+                        run_working_dir,
+                    )
+                if runner.base_dir is None:
+                    runner.base_dir = self.base_dir
+                runner.working_dir = run_working_dir
+                if model_path is not None:
+                    # Unresolved: the runner resolves it under the same base_dir.
+                    runner.checkpoint = Path(model_path)
+                runner.output_dir = Path(self.dataset.working_dir)
+                if isinstance(self.step.train_budget_steps, int):
+                    runner.num_updates = self.step.train_budget_steps
+                if self.seed is not None:
+                    runner.seed = self.seed
+                runner.temperature = self.step.temperature
+                runner.lm_head_fp32 = self.step.fp32_head
+                self.dataset.records_per_update = runner.records_per_update
+                self.dataset.num_samples_per_prompt = runner.samples_per_prompt
+            return super().finalize()
+
+    def __init__(self, config: Config) -> None:
+        """Refuse inconsistent learner and runner settings, then build the loop."""
+        _validate(config)
+        super().__init__(config)
 
 
-def exp000() -> TMaxTrainLoop:
+def exp000() -> TMaxTrainLoop.Config:
     """Configure the published TMax Qwen3.5-4B DPPO recipe.
 
     Hypothesis:
@@ -133,7 +128,7 @@ def exp000() -> TMaxTrainLoop:
       updates. The full training and evaluation run has not been completed.
 
     """
-    config = TMaxTrainLoop()
+    config = TMaxTrainLoop.Config()
     config.study_name = "tmax"
     config.experiment_name = "exp000"
     # Match the released recipe.
@@ -169,7 +164,7 @@ def exp000() -> TMaxTrainLoop:
     return config
 
 
-def exp_smoke() -> TMaxTrainLoop:
+def exp_smoke() -> TMaxTrainLoop.Config:
     """Run one small CPU update to check that TMax training works.
 
     The fixture contains two short responses with different rewards. Their
@@ -204,3 +199,34 @@ def exp_smoke() -> TMaxTrainLoop:
     # The smoke run does not save checkpoints or export a model.
     config.step.export_dir = None
     return config
+
+
+def _validate(config: TMaxTrainLoop.Config) -> None:
+    """Refuse a finalized config whose learner and live-runner settings disagree."""
+    step_pad = config.step.pad_token_id
+    if step_pad is not None and config.dataset.pad_token_id != step_pad:
+        raise ValueError("dataset.pad_token_id must match step.pad_token_id.")
+    dataset = config.dataset
+    if not isinstance(dataset, LiveTMaxRolloutData.Config):
+        return
+    runner = dataset.runner
+    if config.step.model_path is None:
+        raise ValueError("Live TMax requires step.model_path.")
+    if dataset.base_dir != config.working_dir:
+        raise ValueError(
+            "Live TMax dataset.base_dir must inherit the experiment working directory.",
+        )
+    if not isinstance(config.step.train_budget_steps, int):
+        raise TypeError("Live TMax requires an integer step.train_budget_steps.")
+    if config.seed is None:
+        raise ValueError("Live TMax requires an explicit seed.")
+    if dataset.active_sampling != runner.active_sampling:
+        raise ValueError(
+            "Live TMax dataset.active_sampling must match "
+            "dataset.runner.active_sampling.",
+        )
+    if dataset.filter_zero_std_samples != runner.filter_zero_std_samples:
+        raise ValueError(
+            "Live TMax dataset.filter_zero_std_samples must match "
+            "dataset.runner.filter_zero_std_samples.",
+        )

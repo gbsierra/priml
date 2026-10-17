@@ -50,6 +50,7 @@ from torch.utils import checkpoint
 import torch
 
 from priml.math.custom_types import TensorFn
+from priml.model.custom_types import has_weight
 
 
 if TYPE_CHECKING:
@@ -144,7 +145,7 @@ def score_hidden_labels(
         raise ValueError(f"temperature must be positive, got {temperature}.")
     if chunk_size is not None and chunk_size <= 0:
         raise ValueError(f"chunk_size must be positive, got {chunk_size}.")
-    if getattr(head, "bias", None) is not None and fp32_head:
+    if fp32_head and isinstance(head, nn.Linear) and head.bias is not None:
         raise TypeError("The fp32 head projection does not support a biased head.")
     score = _ScoreChunk(head=head, temperature=temperature, fp32_head=fp32_head)
     if chunk_size is None:
@@ -293,33 +294,17 @@ class _ScoreChunk:
     fp32_head: bool
 
     def __call__(self, hidden: Tensor, labels: Tensor) -> Tensor:
+        head = self.head
         if self.fp32_head:
-            weight = _projection_weight(self.head)
-            if weight is None:
+            if not has_weight(head):
                 raise TypeError("The fp32 head has no supported projection weight.")
             # Keep this cast inside the checkpointed chunk. Hoisting the 4B
             # head's 2.37 GiB fp32 copy would retain it through the full
             # backward pass instead of releasing it between recomputations.
             with torch.autocast(device_type=hidden.device.type, enabled=False):
-                logits = hidden.float() @ weight.float()
+                logits = hidden.float() @ head.weight.float().T
         else:
-            logits = self.head(hidden).float()
+            logits = head(hidden).float()
         if self.temperature != 1.0:
             logits = logits / self.temperature
         return log_softmax_and_gather(logits, labels)
-
-
-# A plain head owns its ``[vocab, hidden]`` weight; a tied head
-# (:class:`priml.model.special.TiedLinear`) borrows the embedding's, read through its
-# ``transpose`` flag.
-def _projection_weight(head: object) -> Tensor | None:
-    """Return the ``[hidden, vocab]`` weight a head module projects through."""
-    source = getattr(head, "_source", None)
-    if isinstance(source, nn.Module):
-        weight = getattr(source, "weight", None)
-        if isinstance(weight, Tensor):
-            return weight.T if getattr(head, "transpose", False) else weight
-    weight = getattr(head, "weight", None)
-    if isinstance(weight, Tensor):
-        return weight.T
-    return None

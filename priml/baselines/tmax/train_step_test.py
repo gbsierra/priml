@@ -10,6 +10,7 @@ import json
 import tempfile
 
 from torch import Tensor, nn
+from treekle import json_loads
 
 import pytest
 import torch
@@ -462,11 +463,9 @@ def test_export_round_trips_the_trained_weights(tmp_path: Path) -> None:
     reloaded = Qwen35.load(tmp_path / "export")
     for name, value in step.model.state_dict().items():
         assert torch.equal(reloaded.state_dict()[name], value)
-    written = cast(
-        "dict[str, object]",
-        json.loads(
-            (tmp_path / "export" / "config.json").read_text(encoding="utf-8"),
-        ),
+    written = json_loads(
+        (tmp_path / "export" / "config.json").read_text(encoding="utf-8"),
+        dict[str, object],
     )
     assert written == {**hf_config(), "pad_token_id": 7}
     assert (tmp_path / "export" / "tokenizer.json").is_file()
@@ -565,11 +564,9 @@ def test_export_derives_the_text_only_config(tmp_path: Path) -> None:
     step._checkpoint_metadata["tie_word_embeddings"] = False
     step.export_checkpoint(tmp_path / "export")
 
-    written = cast(
-        "dict[str, object]",
-        json.loads(
-            (tmp_path / "export" / "config.json").read_text(encoding="utf-8"),
-        ),
+    written = json_loads(
+        (tmp_path / "export" / "config.json").read_text(encoding="utf-8"),
+        dict[str, object],
     )
     assert "text_config" not in written
     assert written["architectures"] == ["Qwen3_5ForCausalLM"]

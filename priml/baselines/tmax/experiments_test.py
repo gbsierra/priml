@@ -13,6 +13,7 @@ import torch
 from priml.baselines.tmax import experiments
 from priml.baselines.tmax.experiments import TMaxTrainLoop, exp000, exp_smoke
 from priml.baselines.tmax.live import LiveTMaxRolloutData
+from priml.baselines.tmax.objective import binary_total_variation
 from priml.baselines.tmax.train_step import _row_metrics
 from priml.math.seed import set_seed_local
 from priml.runtime import MultiProcess, SingleProcess
@@ -26,7 +27,7 @@ if TYPE_CHECKING:
     from priml.testing.experiments import ExperimentFactory
 
 
-ALL_EXPERIMENTS: Final[list[ExperimentFactory[TMaxTrainLoop]]] = [
+ALL_EXPERIMENTS: Final[list[ExperimentFactory[TMaxTrainLoop.Config]]] = [
     exp000,
     exp_smoke,
 ]
@@ -38,7 +39,7 @@ ALL_EXPERIMENTS: Final[list[ExperimentFactory[TMaxTrainLoop]]] = [
     ids=[f.__name__ for f in ALL_EXPERIMENTS],
 )
 def test_every_experiment_finalizes(
-    factory: ExperimentFactory[TMaxTrainLoop],
+    factory: ExperimentFactory[TMaxTrainLoop.Config],
 ) -> None:
     """Every experiment config copies and finalizes."""
     assert factory().copy_tree().finalize() is not None
@@ -50,7 +51,7 @@ def test_every_experiment_finalizes(
     ids=[f.__name__ for f in ALL_EXPERIMENTS],
 )
 def test_experiment_name_matches_the_factory(
-    factory: ExperimentFactory[TMaxTrainLoop],
+    factory: ExperimentFactory[TMaxTrainLoop.Config],
 ) -> None:
     """The configured experiment name matches the factory name."""
     assert factory().experiment_name == factory.__name__
@@ -62,7 +63,7 @@ def test_experiment_name_matches_the_factory(
     ids=[f.__name__ for f in ALL_EXPERIMENTS],
 )
 def test_construction_reads_no_files(
-    factory: ExperimentFactory[TMaxTrainLoop],
+    factory: ExperimentFactory[TMaxTrainLoop.Config],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -121,7 +122,7 @@ def test_exp000_names_the_artifact_backed_cluster_recipe() -> None:
     # Active sampling replaces groups removed by the reward-spread filter.
     assert config.dataset.filter_zero_std_samples is True
     assert config.dataset.active_sampling is True
-    assert config.step.divergence_type == "tv"
+    assert config.step.divergence_fn is binary_total_variation
     assert config.step.divergence_threshold == 0.1
     assert config.max_steps == math.inf
     assert config.max_epochs == 1
@@ -182,28 +183,73 @@ def test_dataset_pad_id_must_match_the_step() -> None:
     config = exp_smoke()
     config.dataset.pad_token_id = 7
     with pytest.raises(ValueError, match=r"dataset\.pad_token_id must match"):
-        config.finalize()
+        experiments._validate(config.copy_tree().finalize())
 
 
 def test_live_data_requires_a_model_path() -> None:
     config = exp000()
     config.step.model_path = None
     with pytest.raises(ValueError, match=r"requires step\.model_path"):
-        config.finalize()
+        experiments._validate(config.copy_tree().finalize())
 
 
 def test_live_data_requires_an_integer_update_budget() -> None:
     config = exp000()
     config.step.train_budget_steps = 0.5
     with pytest.raises(TypeError, match=r"integer step\.train_budget_steps"):
-        config.finalize()
+        experiments._validate(config.copy_tree().finalize())
 
 
 def test_live_data_requires_an_explicit_seed() -> None:
     config = exp000()
     config.seed = None
     with pytest.raises(ValueError, match="explicit seed"):
-        config.finalize()
+        experiments._validate(config.copy_tree().finalize())
+
+
+def test_a_finalized_experiment_validates() -> None:
+    """Every shipped experiment passes the loop's guards."""
+    for factory in ALL_EXPERIMENTS:
+        experiments._validate(factory().copy_tree().finalize())
+
+
+def test_finalize_never_raises_for_a_bad_live_setting() -> None:
+    """``finalize`` only declares; a bad value still prints for inspection."""
+    config = exp000()
+    config.seed = None
+    config.step.model_path = None
+    config.copy_tree().finalize()
+
+
+def test_the_loop_builds_from_its_own_config() -> None:
+    assert TMaxTrainLoop.Config.parent_class is TMaxTrainLoop
+
+
+def test_building_the_loop_refuses_an_inconsistent_config() -> None:
+    """``make()`` validates before any runtime, step, or dataset is built."""
+    config = exp000()
+    config.seed = None
+    with pytest.raises(ValueError, match="explicit seed"):
+        config.make()
+
+
+def test_learner_settings_reach_the_live_runner(tmp_path: Path) -> None:
+    """Non-default learner values, so a dropped push cannot hide behind a default."""
+    config = exp000()
+    config.base_dir = tmp_path
+    config.seed = 7
+    config.step.model_path = "/models/other"
+    config.step.train_budget_steps = 3
+    config.step.temperature = 0.5
+    config.step.fp32_head = False
+    config = config.finalize()
+    assert isinstance(config.dataset, LiveTMaxRolloutData.Config)
+    runner = config.dataset.runner
+    assert runner.checkpoint == tmp_path / "models/other"
+    assert runner.num_updates == 3
+    assert runner.seed == 7
+    assert runner.temperature == 0.5
+    assert runner.lm_head_fp32 is False
 
 
 def test_live_data_cannot_escape_the_run_directory(tmp_path: Path) -> None:
@@ -212,7 +258,7 @@ def test_live_data_cannot_escape_the_run_directory(tmp_path: Path) -> None:
     assert isinstance(config.dataset, LiveTMaxRolloutData.Config)
     config.dataset.base_dir = tmp_path / "other"
     with pytest.raises(ValueError, match="must inherit"):
-        config.finalize()
+        experiments._validate(config.copy_tree().finalize())
 
 
 @pytest.mark.parametrize(
@@ -231,7 +277,7 @@ def test_live_data_filter_settings_must_match_the_runner(
     assert isinstance(config.dataset, LiveTMaxRolloutData.Config)
     setattr(config.dataset, field, value)
     with pytest.raises(ValueError, match=field):
-        config.finalize()
+        experiments._validate(config.copy_tree().finalize())
 
 
 def test_smoke_is_a_real_learner_over_the_published_fixture() -> None:

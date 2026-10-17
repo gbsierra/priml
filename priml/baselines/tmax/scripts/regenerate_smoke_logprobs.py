@@ -32,6 +32,7 @@ from treekle import from_plain, json_loads
 
 import torch
 
+from priml.baselines.tmax.data import TMaxRolloutData
 from priml.baselines.tmax.experiments import exp_smoke
 from priml.baselines.tmax.scoring import LogitModel, response_logprobs
 from priml.baselines.tmax.train_step import TMaxDPPOTrainStep
@@ -133,7 +134,7 @@ def _read_records(fixture: Path) -> list[dict[str, object]]:
 
 
 def _packed_update(
-    config: TMaxTrainLoop,
+    config: TMaxTrainLoop.Config,
 ) -> tuple[TMaxDPPOTrainStep, dict[str, object], list[dict[str, object]]]:
     """Build the seeded smoke step and its only batch."""
     # Match the training loop's model initialization.
@@ -141,6 +142,7 @@ def _packed_update(
     step = config.step.make()
     assert isinstance(step, TMaxDPPOTrainStep)
     dataset = config.dataset.make()
+    assert isinstance(dataset, TMaxRolloutData)
     batch = next(iter(dataset.train_dataloader()))
     rows = cast(list[dict[str, object]], step.preprocess_batch(batch)["rows"])
     return step, batch, rows

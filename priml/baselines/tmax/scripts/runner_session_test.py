@@ -114,6 +114,8 @@ class _Envs:
 
 
 class _Loader:
+    _epoch: int = 0
+
     def __next__(self) -> object:
         return {}
 
@@ -199,7 +201,7 @@ def _build_api(
     fake: _BuildUpstream,
     ray: _BuildRay,
     *,
-    actor_manager: ModuleType | None,
+    actor_manager: custom_types.ActorManagerModule | None,
 ) -> UpstreamApi:
     module = cast("object", fake)
     return UpstreamApi(
@@ -212,17 +214,20 @@ def _build_api(
         grpo_utils=cast("custom_types.GrpoUtilsModule", module),
         ground_truth_utils=cast("custom_types.GroundTruthUtilsModule", module),
         model_utils=cast("custom_types.ModelUtilsModule", module),
-        rl_utils=ModuleType("rl"),
+        rl_utils=cast("custom_types.RlUtilsModule", module),
         utils=cast("custom_types.UtilsModule", module),
         vllm_utils=cast("custom_types.VllmUtilsModule", module),
         actor_manager=actor_manager,
     )
 
 
-def _actor_module() -> ModuleType:
-    module = ModuleType("actor_manager")
-    vars(module)["ActorManager"] = "ActorManagerClass"
-    return module
+@dataclass(frozen=True, kw_only=True, slots=True)
+class _ActorManagerModule:
+    ActorManager: object = "ActorManagerClass"
+
+
+def _actor_module() -> _ActorManagerModule:
+    return _ActorManagerModule()
 
 
 def _staged(tmp_path: Path) -> RunnerConfig:

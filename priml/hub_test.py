@@ -16,7 +16,7 @@ import os
 import sys
 
 from torch import nn
-from treekle import ReadError
+from treekle import ReadError, json_loads
 
 import pytest
 import torch
@@ -518,7 +518,7 @@ def test_save_hf_checkpoint_accepts_a_non_dict_mapping(tmp_path: Path) -> None:
         {"weight": torch.ones(1)},
     )
 
-    saved = cast(dict[str, object], json.loads((directory / "config.json").read_text()))
+    saved = json_loads((directory / "config.json").read_text(), dict[str, object])
     assert saved == dict(config)
 
 

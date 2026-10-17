@@ -11,9 +11,8 @@ import math
 
 from configgle import Makeable, Makes, PartialConfig
 from torch import Tensor
-from torch.distributed.checkpoint.state_dict import (  # ty: ignore[unresolved-import] -- PyTorch ships this runtime module without a matching ty stub.
+from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
-    ValueType,
     set_model_state_dict,
 )
 from treekle import ReadError, from_plain, json_loads
@@ -23,7 +22,8 @@ import torch
 from priml import hub
 from priml.baselines.tmax.data import data_parallel_shape
 from priml.baselines.tmax.objective import (
-    DivergenceType,
+    BinaryDivergenceFn,
+    binary_total_variation,
     dppo_mask,
     dppo_token_loss,
     importance_ratio,
@@ -258,7 +258,7 @@ class TMaxDPPOTrainStep(TrainStep):
         )
         """AdamW at the released TMax learning rate."""
 
-        divergence_type: DivergenceType = "tv"
+        divergence_fn: BinaryDivergenceFn = binary_total_variation
         """Binary DPPO divergence; the released 4B recipe uses total variation."""
 
         divergence_threshold: float = 0.1
@@ -357,7 +357,7 @@ class TMaxDPPOTrainStep(TrainStep):
                 config.model = staged_model
             if config.pad_token_id is None:
                 if "pad_token_id" in metadata:
-                    config.pad_token_id = int(cast(int, metadata["pad_token_id"]))
+                    config.pad_token_id = from_plain(metadata["pad_token_id"], int)
                 else:
                     # The released source's config.json carries no pad id;
                     # upstream's trainer resolves the tokenizer's, and so
@@ -601,7 +601,7 @@ class TMaxDPPOTrainStep(TrainStep):
             ratio=ratio,
             response_mask=shifted_mask,
             divergence_threshold=self.config.divergence_threshold,
-            divergence_type=self.config.divergence_type,
+            divergence_fn=self.config.divergence_fn,
         )
         per_token = dppo_token_loss(
             advantages=shifted_advantages,
@@ -647,7 +647,7 @@ def _load_checkpoint_state(model: torch.nn.Module, state: dict[str, Tensor]) -> 
     if any(isinstance(value, DTensor) for value in model.state_dict().values()):
         set_model_state_dict(
             model,
-            cast("dict[str, ValueType]", state),
+            state,
             options=StateDictOptions(full_state_dict=True, strict=True),
         )
         return
@@ -829,16 +829,14 @@ def _cluster_attention(config: Qwen35.Config) -> Qwen35.Config:
 # it, and the text architecture ``save_pretrained`` would record.
 def _text_only_config(metadata: Mapping[str, object]) -> dict[str, object]:
     """Derive the text-only ``config.json`` a text export carries."""
-    nested = metadata.get("text_config")
-    if not isinstance(nested, Mapping):
+    try:
+        result = from_plain(metadata.get("text_config"), dict[str, object])
+    except ReadError as error:
         raise TypeError(
             "Checkpoint export found a conditional-generation config.json "
             "with no text_config to derive a text-only config from; set "
             "step.model_path to a text-only source.",
-        )
-    # JSON objects carry string keys, so the staged checkpoint's nested
-    # mapping is the string-keyed config the export writes.
-    result = dict(cast("Mapping[str, object]", nested))
+        ) from error
     if "tie_word_embeddings" in metadata:
         result["tie_word_embeddings"] = metadata["tie_word_embeddings"]
     result["architectures"] = ["Qwen3_5ForCausalLM"]

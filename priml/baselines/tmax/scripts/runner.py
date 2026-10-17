@@ -42,7 +42,6 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from types import ModuleType
 from typing import TYPE_CHECKING, Final, Protocol, Self, cast, override
 
 import argparse
@@ -58,6 +57,7 @@ from treekle import ReadError, from_plain
 from priml.baselines.tmax.scripts import upstream
 from priml.baselines.tmax.scripts.custom_types import (
     ActorManagerHandle,
+    ActorManagerModule,
     Batch,
     DataLoaderModule,
     DatasetTransformationModule,
@@ -73,6 +73,7 @@ from priml.baselines.tmax.scripts.custom_types import (
     PromptLoader,
     Ray,
     RayQueue,
+    RlUtilsModule,
     UtilsModule,
     VllmUtilsModule,
     WeightTransferBase,
@@ -364,10 +365,10 @@ class UpstreamApi:
     grpo_utils: GrpoUtilsModule
     ground_truth_utils: GroundTruthUtilsModule
     model_utils: ModelUtilsModule
-    rl_utils: ModuleType
+    rl_utils: RlUtilsModule
     utils: UtilsModule
     vllm_utils: VllmUtilsModule
-    actor_manager: ModuleType | None = None
+    actor_manager: ActorManagerModule | None = None
     weight_transfer: tuple[WeightTransferBase, WeightTransferNccl] | None = None
     """vLLM's ``distributed.weight_transfer`` entry points, or ``None``.
 
@@ -468,10 +469,10 @@ def load_upstream_api(
             modules["ground_truth_utils"],
         ),
         model_utils=cast("ModelUtilsModule", modules["model_utils"]),
-        rl_utils=modules["rl_utils"],
+        rl_utils=cast("RlUtilsModule", modules["rl_utils"]),
         utils=cast("UtilsModule", modules["utils"]),
         vllm_utils=cast("VllmUtilsModule", modules["vllm_utils"]),
-        actor_manager=modules["actor_manager"],
+        actor_manager=cast("ActorManagerModule", modules["actor_manager"]),
         weight_transfer=weight_transfer,
     )
 
@@ -547,7 +548,7 @@ def prime_prompts(config: RunnerConfig, session: CollectionSession) -> int:
     for _ in range(count):
         api.data_loader.add_prompt_to_generator(
             next(session.iter_dataloader),
-            cast("int", getattr(session.iter_dataloader, "_epoch", 0)),
+            session.iter_dataloader._epoch,  # noqa: SLF001 -- Upstream's own prompt producer reads it.
             session.prompt_queue,
             session.generation_config,
             is_eval=False,
@@ -740,10 +741,7 @@ def records_for_update(
         step=step,
         advantages=advantages,
         num_samples_per_prompt=config.samples_per_prompt,
-        request_info_for_sample=cast(
-            "Callable[[object, int], Mapping[str, object] | None]",
-            vars(session.api.rl_utils)["_get_request_info_for_sample"],
-        ),
+        request_info_for_sample=session.api.rl_utils._get_request_info_for_sample,  # noqa: SLF001 -- The released writer's own per-sample reader.
     )
 
 
@@ -1119,8 +1117,7 @@ def _build_initialized_session(
     vllm_config.vllm_tensor_parallel_size = config.tensor_parallel_size
     if api.actor_manager is None:
         raise RuntimeError("The upstream API does not expose ActorManager.")
-    actor_manager_type = cast("object", vars(api.actor_manager)["ActorManager"])
-    actor_manager = api.ray.remote(actor_manager_type).remote(
+    actor_manager = api.ray.remote(api.actor_manager.ActorManager).remote(
         {
             "Inference Results Queue": inference_queue,
             "Prompt Queue": prompt_queue,

@@ -1,4 +1,4 @@
-TMaxTrainLoop(
+TMaxTrainLoop.Config(
         study_name='tmax',
         experiment_name='exp000',
         base_dir='/opt/scratch',
@@ -1723,7 +1723,7 @@ TMaxTrainLoop(
         │   base_dir=PosixPath('/opt/scratch/runs/tmax/exp000'),
         │   working_dir=PosixPath('/opt/scratch/runs/tmax/exp000'),
         │   export_dir=PosixPath('/opt/scratch/runs/tmax/exp000/export'),
-        │   divergence_type='tv',
+        │   divergence_fn=priml.baselines.tmax.objective.binary_total_variation,
         │   divergence_threshold=0.1,
         │   temperature=1.0,
         │   head_chunk_size=2_048,
@@ -1736,7 +1736,7 @@ TMaxTrainLoop(
         │   tool_mask_path=None,
         │   records_per_update=256,
         │   num_samples_per_prompt=32,
-        │   advantage_normalization='centered',
+        │   advantage_fn=priml.baselines.tmax.rollouts.centered_advantages,
         │   pack_length=67_584,
         │   pad_token_id=248_044,
         │   mask_tool_use=True,

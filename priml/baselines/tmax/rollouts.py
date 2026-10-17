@@ -26,7 +26,7 @@ upstream implementation.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Final, Literal, cast
+from typing import TYPE_CHECKING, Final, cast
 
 import math
 
@@ -40,8 +40,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping, Sequence
     from pathlib import Path
 
-AdvantageNormalization = Literal["standard", "centered", "maxrl"]
-"""How a prompt group's rewards become advantages; TMax's 4B recipe centers."""
+    from priml.math.custom_types import TensorFn
 
 
 _REQUIRED_FIELDS: Final = (
@@ -229,11 +228,61 @@ def parse_json_float(value: object, *, origin: str, field: str) -> float:
     return result
 
 
+def centered_advantages(grouped: Tensor) -> Tensor:
+    """Subtract each group's mean reward; TMax's 4B setting.
+
+    Args:
+      grouped: Rewards, ``[groups, samples_per_prompt]``.
+
+    Returns:
+      advantages: Same shape, centered per group.
+
+    """
+    return grouped - grouped.mean(dim=-1, keepdim=True)
+
+
+def standard_advantages(grouped: Tensor) -> Tensor:
+    """Center each group, then divide by its spread.
+
+    The division inflates the gradient of a group that nearly all succeeded,
+    which is exactly the group carrying the least information; that is why the
+    released recipe uses :func:`centered_advantages` instead.
+
+    Args:
+      grouped: Rewards, ``[groups, samples_per_prompt]``.
+
+    Returns:
+      advantages: Same shape, standardized per group.
+
+    """
+    spread = grouped.std(dim=-1, keepdim=True, unbiased=False)
+    return centered_advantages(grouped) / (spread + _STANDARD_EPS)
+
+
+def maxrl_advantages(grouped: Tensor) -> Tensor:
+    """Center and divide by the mean reward; zero for a non-positive mean.
+
+    Args:
+      grouped: Rewards, ``[groups, samples_per_prompt]``.
+
+    Returns:
+      advantages: Same shape.
+
+    """
+    mean = grouped.mean(dim=-1, keepdim=True)
+    positive = mean > 0.0
+    return torch.where(
+        positive,
+        (grouped - mean) / torch.where(positive, mean, torch.ones_like(mean)),
+        torch.zeros_like(grouped),
+    )
+
+
 def group_advantages(
     rewards: Sequence[float],
     *,
     num_samples_per_prompt: int,
-    normalization: AdvantageNormalization = "centered",
+    advantage_fn: TensorFn = centered_advantages,
 ) -> Tensor:
     """Turn per-rollout rewards into per-rollout advantages, group by group.
 
@@ -241,22 +290,17 @@ def group_advantages(
     samples drawn from the same prompt, which is why ``rewards`` must arrive in
     the consecutive grouped order the rollout batch was built in.
 
-    ``centered`` -- TMax's 4B setting -- subtracts the group mean and does NOT
-    divide by the group's spread. The division is what ``standard`` does, and it
-    inflates the gradient of a group that nearly all succeeded, which is exactly
-    the group carrying the least information.
-
     Args:
       rewards: One reward per rollout, grouped consecutively by prompt.
       num_samples_per_prompt: Group size; TMax's 4B recipe draws 32.
-      normalization: Which of upstream's three baselines to apply.
+      advantage_fn: Baseline over ``[groups, samples_per_prompt]`` rewards.
 
     Returns:
       advantages: One float32 advantage per rollout, in input order.
 
     Raises:
-      ValueError: The group size is not positive, the reward count is not a
-        multiple of it, or ``normalization`` is unknown.
+      ValueError: The group size is not positive, or the reward count is not a
+        multiple of it.
 
     """
     if num_samples_per_prompt <= 0:
@@ -272,23 +316,7 @@ def group_advantages(
         -1,
         num_samples_per_prompt,
     )
-    mean = grouped.mean(dim=-1, keepdim=True)
-    if normalization == "centered":
-        advantages = grouped - mean
-    elif normalization == "standard":
-        spread = grouped.std(dim=-1, keepdim=True, unbiased=False)
-        advantages = (grouped - mean) / (spread + _STANDARD_EPS)
-    elif normalization == "maxrl":
-        advantages = torch.where(
-            mean > 0.0,
-            (grouped - mean) / torch.where(mean > 0.0, mean, torch.ones_like(mean)),
-            torch.zeros_like(grouped),
-        )
-    else:
-        raise ValueError(  # pyright: ignore[reportUnreachable] -- Literal-typed config can still carry any string at runtime.
-            f"Invalid advantage normalization: {normalization!r}.",
-        )
-    return advantages.reshape(-1)
+    return advantage_fn(grouped).reshape(-1)
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)

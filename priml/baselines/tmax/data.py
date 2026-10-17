@@ -17,15 +17,16 @@ from configgle import Fig
 from treekle import ReadError, json_loads
 
 from priml.baselines.tmax.rollouts import (
-    AdvantageNormalization,
     PackedRow,
     RolloutRecord,
+    centered_advantages,
     group_advantages,
     pack_rollouts,
     parse_json_integer,
     parse_json_integer_array,
     read_rollout_records,
 )
+from priml.math.custom_types import TensorFn
 from priml.paths import resolve_working_dir
 from priml.runtime import global_device_mesh
 from priml.timer import CheckpointableStepTimer
@@ -103,8 +104,8 @@ class TMaxRolloutData:
         num_samples_per_prompt: int = 32
         """Group size used by the centered reward baseline."""
 
-        advantage_normalization: AdvantageNormalization = "centered"
-        """Reward normalization from the released 4B recipe."""
+        advantage_fn: TensorFn = centered_advantages
+        """Group reward baseline; the released 4B recipe centers."""
 
         pack_length: int = 67_584
         """Maximum prompt-plus-response tokens per packed row."""
@@ -249,7 +250,7 @@ class TMaxRolloutData:
         advantages = group_advantages(
             rewards,
             num_samples_per_prompt=self.config.num_samples_per_prompt,
-            normalization=self.config.advantage_normalization,
+            advantage_fn=self.config.advantage_fn,
         )
         rows = pack_rollouts(
             batch,
@@ -340,7 +341,7 @@ class TMaxRolloutData:
         advantages = group_advantages(
             [record.reward for record in records],
             num_samples_per_prompt=self.config.num_samples_per_prompt,
-            normalization=self.config.advantage_normalization,
+            advantage_fn=self.config.advantage_fn,
         )
         rows = pack_rollouts(
             records,

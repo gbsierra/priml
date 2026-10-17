@@ -10,11 +10,11 @@ import pytest
 import torch
 
 from priml.baselines.tmax.scoring import (
-    _projection_weight,
     response_logprobs,
     score_hidden_labels,
 )
 from priml.baselines.tmax.train_step import tiny_qwen35_config
+from priml.model.custom_types import has_weight
 
 
 if TYPE_CHECKING:
@@ -265,8 +265,8 @@ def test_the_fp32_head_casts_its_operands_before_the_matmul() -> None:
     model = tiny_qwen35_config(vocab_size=64).make().eval()
     head = model.proj_out
     assert head is not None
-    weight = _projection_weight(head)
-    assert weight is not None
+    assert has_weight(head)
+    weight = head.weight.T
     hidden = torch.randn(2, 5, 16, dtype=torch.bfloat16)
     labels = torch.tensor([[1, 2, 3, 4], [4, 3, 2, 1]])
     with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
@@ -301,8 +301,8 @@ def test_the_fp32_head_projects_a_tied_head_through_the_embedding() -> None:
     assert head is not None
     # The tied head borrows the embedding's weight, so the expected
     # projection reads it through the same borrowing.
-    weight = _projection_weight(head)
-    assert weight is not None
+    assert has_weight(head)
+    weight = head.weight.T
     hidden = torch.randn(2, 5, 16, dtype=torch.bfloat16)
     labels = torch.tensor([[1, 2, 3, 4], [4, 3, 2, 1]])
     with torch.autocast(device_type="cpu", dtype=torch.bfloat16):

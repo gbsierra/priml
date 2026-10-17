@@ -12,6 +12,8 @@ import subprocess
 import tarfile
 import tempfile
 
+from treekle import json_loads
+
 import pyarrow as pa
 import pytest
 
@@ -444,7 +446,7 @@ def test_manifest_records_all_staged_files_and_source_pins(tmp_path: Path) -> No
     (rollouts / prepare_data.SHARD_NAME).write_text("{}\n")
 
     manifest = prepare_data._write_manifest(checkpoint, rollouts)
-    payload = cast(dict[str, object], json.loads(manifest.read_text(encoding="utf-8")))
+    payload = json_loads(manifest.read_text(encoding="utf-8"), dict[str, object])
     dataset = cast(dict[str, object], payload["dataset"])
 
     assert payload["experiment"] == "exp000"
@@ -476,7 +478,7 @@ def test_manifest_records_the_upstream_pin_without_hashing_it(
         rollouts,
         upstream_dir=upstream_dir,
     )
-    payload = cast(dict[str, object], json.loads(manifest.read_text()))
+    payload = json_loads(manifest.read_text(), dict[str, object])
 
     assert payload["upstream"] == {
         "repo": upstream.UPSTREAM_REPO,
@@ -565,10 +567,7 @@ def test_verification_refuses_a_manifest_with_different_source_pins(
         dataset_dir=dataset,
         path=tmp_path / prepare_data.MANIFEST_NAME,
     )
-    payload = cast(
-        "dict[str, object]",
-        json.loads(manifest.read_text(encoding="utf-8")),
-    )
+    payload = json_loads(manifest.read_text(encoding="utf-8"), dict[str, object])
     dataset_payload = cast("dict[str, object]", payload["dataset"])
     dataset_payload["revision"] = "different"
     manifest.write_text(json.dumps(payload), encoding="utf-8")

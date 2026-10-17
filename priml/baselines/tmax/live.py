@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import asdict, field
 from typing import TYPE_CHECKING, Protocol, override, runtime_checkable
 
+from configgle import Makes
 from treekle import from_plain
 
 from priml.baselines.tmax.data import TMaxRolloutData
@@ -57,7 +58,10 @@ class ExportsHFState(Protocol):
 class LiveTMaxRolloutData(TMaxRolloutData):
     """Collect one TMax update immediately before each learner update."""
 
-    class Config(TMaxRolloutData.Config):
+    class Config(
+        Makes["LiveTMaxRolloutData"],
+        TMaxRolloutData.Config,
+    ):
         """Recorded-data settings plus the pinned live TMax runtime."""
 
         runner: RunnerConfig = field(default_factory=RunnerConfig)
