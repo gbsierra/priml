@@ -10,6 +10,8 @@ import json
 import subprocess
 import time
 
+from treekle import json_loads
+
 import pytest
 
 from priml.baselines.tmax.scripts import (
@@ -36,6 +38,14 @@ from priml.baselines.tmax.scripts.eval import (
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+
+
+def _ignore(*args: object, **kwargs: object) -> None:
+    del args, kwargs
+
+
+def _same_path(root: Path) -> Path:
+    return root
 
 
 def _config(tmp_path: Path) -> EvalConfig:
@@ -387,6 +397,41 @@ def test_server_readiness_requires_the_requested_model() -> None:
     assert response.closed
 
 
+def test_server_readiness_returns_once_the_model_is_listed() -> None:
+    """Return as soon as the server lists the requested model."""
+    response = _ModelsResponse("requested-model")
+    wait_for_server(
+        8008,
+        "requested-model",
+        timeout=1.0,
+        sleep=lambda _: pytest.fail("must not wait once ready"),
+        urlopen=lambda *_args, **_kwargs: response,
+    )
+    assert response.closed
+
+
+def test_server_readiness_retries_after_a_refused_connection() -> None:
+    """Keep polling while the port refuses connections."""
+    attempts = iter((ConnectionRefusedError(), _ModelsResponse("requested-model")))
+
+    def urlopen(*_args: object, **_kwargs: object) -> _ModelsResponse:
+        attempt = next(attempts)
+        if isinstance(attempt, OSError):
+            raise attempt
+        return attempt
+
+    sleeps: list[float] = []
+    wait_for_server(
+        8008,
+        "requested-model",
+        timeout=60.0,
+        interval=0.5,
+        sleep=sleeps.append,
+        urlopen=urlopen,
+    )
+    assert sleeps == [0.5]
+
+
 def test_server_readiness_rejects_an_exited_process() -> None:
     """Treat an exited server as an error, not a slow start."""
 
@@ -405,6 +450,209 @@ def test_server_readiness_rejects_an_exited_process() -> None:
             server=server,
             urlopen=lambda *_args, **_kwargs: pytest.fail("must not probe"),
         )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"data_parallel_size": 0}, "data_parallel_size and n_concurrent"),
+        ({"n_attempts": 0}, "n_attempts must be positive"),
+        ({"max_format_errors": 0}, "max_format_errors must be positive"),
+        ({"n_tasks": 0}, "n_tasks must be positive"),
+        ({"tensor_parallel_size": 0}, "tensor_parallel_size must be positive"),
+    ],
+)
+def test_eval_config_rejects_invalid_counts(
+    tmp_path: Path,
+    overrides: dict[str, int],
+    match: str,
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        replace(_config(tmp_path), **overrides)
+
+
+def test_eval_config_requires_the_checkout_and_checkpoint(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    with pytest.raises(FileNotFoundError, match="TMax checkout is missing"):
+        replace(config, tmax_root=tmp_path / "absent")
+    with pytest.raises(FileNotFoundError, match="Exported checkpoint is missing"):
+        replace(config, checkpoint=tmp_path / "absent")
+
+
+def test_optional_limits_reach_the_commands(tmp_path: Path) -> None:
+    config = replace(_config(tmp_path), max_model_len=4_096, n_tasks=3)
+    vllm = build_vllm_command(config)
+    assert vllm[vllm.index("--max-model-len") + 1] == "4096"
+    harbor = build_harbor_command(config)
+    assert harbor[harbor.index("--n-tasks") + 1] == "3"
+
+
+class _RunningServer:
+    """A vLLM process that is still up, then exits on terminate or kill."""
+
+    def __init__(self, *, ignores_terminate: bool = False) -> None:
+        self.events: list[str] = []
+        self.ignores_terminate = ignores_terminate
+
+    def poll(self) -> int | None:
+        return None
+
+    def terminate(self) -> None:
+        self.events.append("terminate")
+
+    def kill(self) -> None:
+        self.events.append("kill")
+
+    def wait(self, timeout: float) -> int:
+        self.events.append(f"wait{timeout:.0f}")
+        if self.ignores_terminate and self.events.count("kill") == 0:
+            raise subprocess.TimeoutExpired("vllm", timeout)
+        return 0
+
+
+@pytest.mark.parametrize(
+    ("ignores_terminate", "expected"),
+    [
+        (False, ["terminate", "wait30"]),
+        (True, ["terminate", "wait30", "kill", "wait30"]),
+    ],
+)
+def test_stopping_vllm_escalates_to_kill(
+    *,
+    ignores_terminate: bool,
+    expected: list[str],
+) -> None:
+    server = _RunningServer(ignores_terminate=ignores_terminate)
+    eval_module._stop_server(cast(subprocess.Popen[bytes], cast(object, server)))
+    assert server.events == expected
+
+
+def test_a_failed_harbor_run_records_the_failure_and_stops_vllm(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(_config(tmp_path), environment="docker")
+    server = _RunningServer()
+
+    def fail(
+        command: Sequence[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess(args=list(command), returncode=2)
+
+    monkeypatch.setattr(eval_module, "wait_for_server", _ignore)
+    with pytest.raises(subprocess.CalledProcessError):
+        eval_module.run(
+            config,
+            popen=lambda *_args, **_kwargs: cast(
+                subprocess.Popen[bytes],
+                cast(object, server),
+            ),
+            run_command=fail,
+        )
+    payload = json_loads(config.provenance_path.read_bytes(), dict[str, object])
+    assert payload["status"] == "failed"
+    assert payload["error"] == "CalledProcessError"
+    assert server.events[0] == "terminate"
+
+
+def test_stats_must_write_the_metrics_file(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError, match="without writing"):
+        eval_module._require_metrics(tmp_path / "metrics.json")
+
+
+def test_an_empty_checkpoint_cannot_be_evaluated(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="contains no files"):
+        eval_module._checkpoint_files(tmp_path)
+
+
+def test_existing_outputs_without_a_manifest_are_refused(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config.job_dir.mkdir(parents=True)
+    (config.job_dir / "trial").mkdir()
+    with pytest.raises(FileExistsError, match="no PriML manifest"):
+        eval_module._require_existing_job_identity(config, {})
+
+
+def test_an_unreadable_manifest_is_refused(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config.provenance_path.parent.mkdir(parents=True)
+    config.provenance_path.write_text("not json", encoding="utf-8")
+    with pytest.raises(ValueError, match="Cannot read evaluation manifest"):
+        eval_module._require_existing_job_identity(config, {})
+
+
+def test_a_non_daytona_environment_needs_no_preflight(tmp_path: Path) -> None:
+    eval_module._preflight_environment(
+        replace(_config(tmp_path), environment="docker"),
+        run_command=lambda *_args, **_kwargs: pytest.fail("must not probe"),
+    )
+
+
+class _GarbageResponse:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def read(self) -> bytes:
+        return b"not json"
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_server_readiness_keeps_polling_past_an_unparseable_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    times = iter((0.0, 0.0, 2.0))
+    response = _GarbageResponse()
+    monkeypatch.setattr(time, "monotonic", lambda: next(times))
+    with pytest.raises(TimeoutError):
+        wait_for_server(
+            8008,
+            "m",
+            timeout=1.0,
+            sleep=lambda _: None,
+            urlopen=lambda *_args, **_kwargs: response,
+        )
+    assert response.closed
+
+
+def test_main_runs_one_job_from_the_command_line(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    run_dir = tmp_path / "runs/tmax/exp000"
+    (run_dir / "export").mkdir(parents=True)
+    (run_dir / "export" / "config.json").write_text("{}", encoding="utf-8")
+    checkout = tmp_path / "datasets/tmax/upstream/tmax"
+    checkout.mkdir(parents=True)
+    captured: list[EvalConfig] = []
+
+    def run(config: EvalConfig) -> Path:
+        captured.append(config)
+        return config.metrics_path
+
+    monkeypatch.setattr(eval_module, "run", run)
+    monkeypatch.setattr(upstream, "verify_checkout", _same_path)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "eval",
+            "/export",
+            "--base-dir",
+            str(tmp_path),
+            "--results-dir",
+            "/eval",
+            "--job-name",
+            "job",
+            "--gpus",
+            "1",
+        ],
+    )
+    assert eval_module.main() == 0
+    assert captured[0].checkpoint == run_dir / "export"
+    assert captured[0].results_dir == run_dir / "eval"
+    assert capsys.readouterr().out.strip().endswith("metrics.json")
 
 
 if __name__ == "__main__":

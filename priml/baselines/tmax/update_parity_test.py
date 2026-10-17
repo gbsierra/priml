@@ -37,10 +37,12 @@ from priml.testing.golden import read_tensors
 from priml.train.parallelism import NoParallel
 
 
+_CWD: Final = Path(__file__).resolve().parent
+
 if TYPE_CHECKING:
     from torch import Tensor
 
-_TESTDATA: Final = Path(__file__).resolve().parent / "testdata"
+_TESTDATA: Final = _CWD / "testdata"
 _HIDDEN_SIZE: Final = 8
 """Fixture width the record was generated at; half the shared fixture's 16."""
 UPDATES: Final = 5
@@ -135,3 +137,9 @@ def test_five_updates_match_the_pinned_upstream_record() -> None:
                 rtol=0.0,
                 atol=0.0,
             )
+
+
+if __name__ == "__main__":
+    from priml.lib.testing.runner import test_main
+
+    test_main(__file__)

@@ -2,38 +2,166 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass, replace
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from typing import cast
+from typing import NoReturn, cast, overload
 
 import importlib
 import json
 import os
 
+from torch import Tensor
+
+import numpy as np
 import pytest
 import torch
 
 from priml.baselines.tmax.scripts import (
+    custom_types,
     runner as runner_module,
     upstream,
 )
+from priml.baselines.tmax.scripts.rollout_writer import RolloutWriter
 from priml.baselines.tmax.scripts.runner import (
     CollectionSession,
     RayRuntimePolicy,
-    RolloutWriter,
     RunnerConfig,
     UpstreamApi,
-    WeightSync,
     build_session,
-    collect_update,
     prime_prompts,
+    records_for_update,
     run,
     run_updates,
     serialize_rollout_records,
     vllm_weight_name_mapper,
 )
+from priml.baselines.tmax.scripts.weight_sync import WeightSync
+
+
+def _unused(*_args: object, **_kwargs: object) -> NoReturn:
+    raise AssertionError("This test does not reach this upstream call.")
+
+
+def _same(ref: object) -> object:
+    return ref
+
+
+@dataclass(kw_only=True, slots=True)
+class _RuntimeContext:
+    runtime_env: Mapping[str, object]
+
+
+@dataclass(kw_only=True, slots=True)
+class _FakeRay:
+    """A Ray driver whose cluster state each test sets directly."""
+
+    initialized: bool = True
+    runtime_env: Mapping[str, object] = field(
+        default_factory=dict[str, object],
+    )
+    live_nodes: list[Mapping[str, object]] = field(default_factory=list)
+    tasks: Callable[[object], custom_types.RemoteFunction] = _unused
+    resolve: Callable[[object], object] = _same
+    init_calls: list[Mapping[str, object]] = field(default_factory=list)
+    events: list[str] = field(default_factory=list)
+
+    @property
+    def _private(self) -> custom_types.RayPrivate:
+        return _unused()
+
+    def is_initialized(self) -> bool:
+        return self.initialized
+
+    def init(self, *, runtime_env: Mapping[str, object]) -> None:
+        self.init_calls.append(runtime_env)
+        self.initialized = True
+
+    def shutdown(self) -> None:
+        self.events.append("shutdown")
+        self.initialized = False
+
+    def nodes(self) -> list[Mapping[str, object]]:
+        return self.live_nodes
+
+    def get_runtime_context(self) -> object:
+        return _RuntimeContext(runtime_env=self.runtime_env)
+
+    def remote(self, target: object, /) -> custom_types.RemoteFunction:
+        return self.tasks(target)
+
+    @overload
+    def get(self, refs: list[object], /) -> list[object]: ...
+    @overload
+    def get(self, refs: object, /) -> object: ...
+    def get(self, refs: object, /) -> object:
+        if isinstance(refs, list):
+            return [self.resolve(ref) for ref in cast("list[object]", refs)]
+        return self.resolve(refs)
+
+
+@dataclass(kw_only=True, slots=True)
+class _FakeModelDims:
+    def from_hf_config(self, model_name_or_path: str, /) -> object:
+        return _unused(model_name_or_path)
+
+
+@dataclass(kw_only=True, slots=True)
+class _FakeUpstream:
+    """One stand-in for every open-instruct module the driver reads."""
+
+    StreamingDataLoaderConfig: Callable[[], custom_types.StreamingConfig] = _unused
+    VLLMConfig: Callable[[], custom_types.VLLMConfig] = _unused
+    HFDataLoader: Callable[..., custom_types.PromptLoader] = _unused
+    single_example_collator: object = None
+    add_prompt_to_generator: Callable[..., object] = _unused
+    accumulate_inference_batches: Callable[
+        ...,
+        tuple[
+            custom_types.GenerationResult | None,
+            custom_types.Batch | None,
+            object,
+            object,
+        ],
+    ] = _unused
+    compute_group_advantages: Callable[..., custom_types.FloatArray] = _unused
+    TokenizerConfig: Callable[..., object] = _unused
+    EnvsConfig: Callable[..., custom_types.EnvsConfig] = _unused
+    make_tokenizer: Callable[[object, object], object] = _unused
+    initialize_tools_and_envs: Callable[
+        ...,
+        tuple[dict[str, object], object, list[str]],
+    ] = _unused
+    setup_datasets: Callable[..., tuple[object, object]] = _unused
+    build_base_env_config: Callable[[object, object], object] = _unused
+    GRPOExperimentConfig: Callable[[], custom_types.GRPOArgs] = _unused
+    RewardConfig: Callable[..., object] = _unused
+    build_all_verifiers: Callable[[object, object], object] = _unused
+    ModelConfig: Callable[..., object] = _unused
+    ModelDims: _FakeModelDims = field(default_factory=_FakeModelDims)
+    SamplingConfig: Callable[..., object] = _unused
+    create_vllm_engines: Callable[..., list[custom_types.Engine]] = _unused
+    Queue: Callable[..., object] = _unused
+
+    def find_free_port(self) -> int:
+        return _unused()
+
+
+class _FakeLoader:
+    """A prompt loader over a fixed list of examples."""
+
+    def __init__(self, examples: Iterable[object] = ()) -> None:
+        self._examples: Iterator[object] = iter(examples)
+
+    def __next__(self) -> object:
+        return next(self._examples)
+
+    def state_dict(self) -> Mapping[str, object]:
+        return {}
+
+    def load_state_dict(self, state: Mapping[str, object], /) -> None:
+        del state
 
 
 class _Rpc:
@@ -106,54 +234,57 @@ def _trainer_init(info: object) -> dict[str, object]:
     return {"info": info}
 
 
-def _ray_get(refs: object) -> list[object]:
-    return list(cast("Iterable[object]", refs))
+@dataclass(kw_only=True, slots=True)
+class _FakeTransferEngine:
+    """vLLM's trainer-side NCCL engine; records every tensor it sends."""
+
+    sent: list[tuple[str, Tensor]]
+
+    def trainer_init(self, init_info: Mapping[str, object], /) -> object:
+        return _trainer_init(init_info)
+
+    def trainer_send_weights(
+        self,
+        *,
+        iterator: Iterator[tuple[str, Tensor]],
+        trainer_args: object,
+    ) -> None:
+        del trainer_args
+        self.sent.extend(iterator)
 
 
-def _is_initialized() -> bool:
-    return True
+@dataclass(kw_only=True, slots=True)
+class _FakeTransferBase:
+    WeightTransferInitRequest: Callable[..., object] = _init_request
+
+
+@dataclass(kw_only=True, slots=True)
+class _FakeTransferNccl:
+    NCCLWeightTransferEngine: _FakeTransferEngine
+    NCCLTrainerSendWeightsArgs: Callable[..., object] = _init_request
 
 
 def _sync_api(sent: list[tuple[str, torch.Tensor]]) -> UpstreamApi:
     """Build the minimal upstream surface ``WeightSync`` touches."""
-
-    def send_weights(*, iterator: object, trainer_args: object) -> None:
-        del trainer_args
-        sent.extend(cast("Iterable[tuple[str, torch.Tensor]]", iterator))
-
-    weight_transfer = (
-        SimpleNamespace(WeightTransferInitRequest=_init_request),
-        SimpleNamespace(
-            NCCLWeightTransferEngine=SimpleNamespace(
-                trainer_init=_trainer_init,
-                trainer_send_weights=send_weights,
-            ),
-            NCCLTrainerSendWeightsArgs=_init_request,
+    return _api(
+        weight_transfer=(
+            _FakeTransferBase(),
+            _FakeTransferNccl(NCCLWeightTransferEngine=_FakeTransferEngine(sent=sent)),
         ),
     )
-    return UpstreamApi(
-        ray=SimpleNamespace(get=_ray_get, is_initialized=_is_initialized),
-        ray_queue=None,
-        data_loader=ModuleType("data"),
-        dataset_transformation=ModuleType("data"),
-        environments_utils=ModuleType("data"),
-        grpo_fast=ModuleType("data"),
-        grpo_utils=ModuleType("data"),
-        ground_truth_utils=ModuleType("data"),
-        model_utils=ModuleType("data"),
-        rl_utils=ModuleType("data"),
-        utils=ModuleType("data"),
-        vllm_utils=ModuleType("data"),
-        weight_transfer=weight_transfer,
-    )
 
 
-def _sync_session(engines: list[_Engine], api: UpstreamApi) -> CollectionSession:
+def _sync_session(
+    engines: list[_Engine],
+    api: UpstreamApi,
+    *,
+    loader: _FakeLoader | None = None,
+) -> CollectionSession:
     return CollectionSession(
         api=api,
         tokenizer=None,
         dataset=None,
-        iter_dataloader=None,
+        iter_dataloader=loader or _FakeLoader(),
         inference_queue=None,
         prompt_queue=None,
         generation_config=None,
@@ -174,7 +305,8 @@ def test_upstream_import_enables_released_reset_handling(
     observed: list[str | None] = []
     monkeypatch.setenv("SWERL_RESET_FAILURE_ZERO_REWARD", "0")
 
-    def verified(_root: Path) -> Path:
+    def verified(root: Path) -> Path:
+        del root
         return tmp_path
 
     monkeypatch.setattr(upstream, "verify_checkout", verified)
@@ -209,75 +341,89 @@ def test_ray_init_forwards_only_the_runtime_allowlist(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Ray workers get the allowlist only; ambient credentials never travel.
-    calls: list[dict[str, object]] = []
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "do-not-forward")
-
-    def init(**kwargs: object) -> None:
-        calls.append(kwargs)
-
-    ray = SimpleNamespace(
-        is_initialized=lambda: False,
-        init=init,
-    )
+    ray = _FakeRay(initialized=False)
     assert runner_module._initialize_ray(RunnerConfig(), ray)
-    assert calls == [
-        {"runtime_env": {"env_vars": RayRuntimePolicy().env_vars()}},
-    ]
+    assert ray.init_calls == [{"env_vars": RayRuntimePolicy().env_vars()}]
     assert "AWS_SECRET_ACCESS_KEY" not in cast(
-        dict[str, str],
-        cast(dict[str, object], calls[0]["runtime_env"])["env_vars"],
+        "dict[str, str]",
+        ray.init_calls[0]["env_vars"],
     )
 
 
 def test_existing_ray_requires_a_matching_runtime_policy() -> None:
     # An already-running Ray job must carry the same runtime policy.
-    ray = SimpleNamespace(
-        is_initialized=lambda: True,
-        get_runtime_context=lambda: SimpleNamespace(
-            runtime_env={"env_vars": RayRuntimePolicy().env_vars()},
-        ),
-    )
+    ray = _FakeRay(runtime_env={"env_vars": RayRuntimePolicy().env_vars()})
     assert not runner_module._initialize_ray(RunnerConfig(), ray)
-    ray.get_runtime_context = lambda: SimpleNamespace(runtime_env={})
+    ray.runtime_env = {}
     with pytest.raises(RuntimeError, match="already initialized"):
         runner_module._initialize_ray(RunnerConfig(), ray)
 
 
-def test_checkpoint_must_match_on_every_live_ray_node(tmp_path: Path) -> None:
-    # vLLM actors load this path remotely; a driver-local checkpoint is not enough.
+@dataclass(kw_only=True, slots=True)
+class _NodeRef:
+    node: str
+    path: str
+
+
+@dataclass(kw_only=True, slots=True)
+class _PinnedProbe:
+    """``remote`` for one node: returns a ref naming the node it ran on."""
+
+    node: str
+
+    def remote(self, *args: object, **_kwargs: object) -> object:
+        return _NodeRef(node=self.node, path=str(args[0]))
+
+
+@dataclass(kw_only=True, slots=True)
+class _InventoryProbe:
+    """The checkpoint-inventory task; ``options`` pins it to one node."""
+
+    def remote(self, *_args: object, **_kwargs: object) -> object:
+        return _unused()
+
+    def options(self, **kwargs: object) -> _PinnedProbe:
+        resources = cast("dict[str, float]", kwargs["resources"])
+        return _PinnedProbe(node=next(iter(resources)).removeprefix("node:"))
+
+
+def _probe_task(target: object) -> custom_types.RemoteFunction:
+    assert target is runner_module._checkpoint_inventory
+    return _InventoryProbe()
+
+
+def _probe_ray(
+    nodes: list[Mapping[str, object]],
+    inventory_on: Callable[[str], object],
+) -> _FakeRay:
+    """Build a cluster whose node ``n`` reports ``inventory_on(n)``."""
+    return _FakeRay(
+        live_nodes=nodes,
+        tasks=_probe_task,
+        resolve=lambda ref: inventory_on(cast("_NodeRef", ref).node),
+    )
+
+
+def _staged_checkpoint(tmp_path: Path, contents: str = "{}") -> Path:
     checkpoint = tmp_path / "checkpoint"
     checkpoint.mkdir()
-    (checkpoint / "config.json").write_text("{}", encoding="utf-8")
+    (checkpoint / "config.json").write_text(contents, encoding="utf-8")
+    return checkpoint
+
+
+def test_checkpoint_must_match_on_every_live_ray_node(tmp_path: Path) -> None:
+    # vLLM actors load this path remotely; a driver-local checkpoint is not enough.
+    checkpoint = _staged_checkpoint(tmp_path)
     expected = runner_module._checkpoint_inventory(str(checkpoint))
-
-    class _Probe:
-        def options(self, **kwargs: object) -> object:
-            resources = cast(dict[str, float], kwargs["resources"])
-            node = next(iter(resources)).removeprefix("node:")
-
-            def remote(path: str) -> tuple[str, str]:
-                return node, path
-
-            return SimpleNamespace(remote=remote)
-
-    nodes = [
-        {"Alive": True, "NodeManagerAddress": "10.0.0.1"},
-        {"Alive": True, "NodeManagerAddress": "10.0.0.2"},
-        {"Alive": False, "NodeManagerAddress": "10.0.0.3"},
-    ]
-
-    def get(refs: object) -> list[object]:
-        return [
-            expected if node == "10.0.0.1" else None
-            for node, _path in cast("Iterable[tuple[str, str]]", refs)
-        ]
-
-    def remote(target: object) -> _Probe:
-        if target is runner_module._checkpoint_inventory:
-            return _Probe()
-        pytest.fail("unexpected Ray task")
-
-    ray = SimpleNamespace(nodes=lambda: nodes, remote=remote, get=get)
+    ray = _probe_ray(
+        [
+            {"Alive": True, "NodeManagerAddress": "10.0.0.1"},
+            {"Alive": True, "NodeManagerAddress": "10.0.0.2"},
+            {"Alive": False, "NodeManagerAddress": "10.0.0.3"},
+        ],
+        lambda node: expected if node == "10.0.0.1" else None,
+    )
     with pytest.raises(RuntimeError, match=r"10\.0\.0\.2.*shared storage"):
         runner_module._require_checkpoint_on_ray_nodes(checkpoint, ray)
 
@@ -285,26 +431,12 @@ def test_checkpoint_must_match_on_every_live_ray_node(tmp_path: Path) -> None:
 def test_checkpoint_probe_accepts_the_same_inventory_on_every_node(
     tmp_path: Path,
 ) -> None:
-    checkpoint = tmp_path / "checkpoint"
-    checkpoint.mkdir()
-    (checkpoint / "config.json").write_text("{}", encoding="utf-8")
+    checkpoint = _staged_checkpoint(tmp_path)
     expected = runner_module._checkpoint_inventory(str(checkpoint))
     assert expected is not None
-
-    class _Probe:
-        def options(self, **_kwargs: object) -> object:
-            def remote(_path: str) -> tuple[tuple[str, int, str], ...]:
-                return expected
-
-            return SimpleNamespace(remote=remote)
-
-    def remote(_target: object) -> _Probe:
-        return _Probe()
-
-    ray = SimpleNamespace(
-        nodes=lambda: [{"Alive": True, "NodeManagerAddress": "10.0.0.1"}],
-        remote=remote,
-        get=_ray_get,
+    ray = _probe_ray(
+        [{"Alive": True, "NodeManagerAddress": "10.0.0.1"}],
+        lambda _node: expected,
     )
     runner_module._require_checkpoint_on_ray_nodes(checkpoint, ray)
 
@@ -312,10 +444,8 @@ def test_checkpoint_probe_accepts_the_same_inventory_on_every_node(
 def test_checkpoint_probe_rejects_same_size_different_contents(
     tmp_path: Path,
 ) -> None:
-    checkpoint = tmp_path / "checkpoint"
-    checkpoint.mkdir()
+    checkpoint = _staged_checkpoint(tmp_path, "left")
     config = checkpoint / "config.json"
-    config.write_text("left", encoding="utf-8")
     expected = runner_module._checkpoint_inventory(str(checkpoint))
     assert expected is not None
     config.write_text("rite", encoding="utf-8")
@@ -326,27 +456,15 @@ def test_checkpoint_probe_rejects_same_size_different_contents(
     ]
     assert expected != different
     config.write_text("left", encoding="utf-8")
-
-    class _Probe:
-        def options(self, **_kwargs: object) -> object:
-            def remote(_path: str) -> tuple[tuple[str, int, str], ...]:
-                return different
-
-            return SimpleNamespace(remote=remote)
-
-    def remote(_target: object) -> _Probe:
-        return _Probe()
-
-    ray = SimpleNamespace(
-        nodes=lambda: [{"Alive": True, "NodeManagerAddress": "10.0.0.1"}],
-        remote=remote,
-        get=_ray_get,
+    ray = _probe_ray(
+        [{"Alive": True, "NodeManagerAddress": "10.0.0.1"}],
+        lambda _node: different,
     )
     with pytest.raises(RuntimeError, match=r"differs.*10\.0\.0\.1"):
         runner_module._require_checkpoint_on_ray_nodes(checkpoint, ray)
 
 
-@dataclass
+@dataclass(kw_only=True, slots=True)
 class _FakeBatch:
     """The upstream batch fields used by the serializer."""
 
@@ -356,7 +474,7 @@ class _FakeBatch:
     ground_truths: Sequence[object]
 
 
-@dataclass
+@dataclass(kw_only=True, slots=True)
 class _FakeResult:
     """The upstream generation result fields used by the serializer."""
 
@@ -386,28 +504,35 @@ def _result() -> _FakeResult:
     )
 
 
-def _request_info(_request_info: object, index: int) -> dict[str, object]:
+def _request_info(request_info: object, index: int) -> dict[str, object]:
+    del request_info
     return {"sample": index}
 
 
-def _api() -> UpstreamApi:
+def _api(
+    *,
+    ray: _FakeRay | None = None,
+    upstream_modules: _FakeUpstream | None = None,
+    weight_transfer: tuple[_FakeTransferBase, _FakeTransferNccl] | None = None,
+) -> UpstreamApi:
     """Build an upstream-shaped fake without importing Ray."""
-    modules = {name: ModuleType(name) for name in ("data", "rl")}
-    modules["rl"].__dict__["_get_request_info_for_sample"] = _request_info
+    rl = ModuleType("rl")
+    vars(rl)["_get_request_info_for_sample"] = _request_info
+    fake = upstream_modules or _FakeUpstream()
     return UpstreamApi(
-        ray=None,
-        ray_queue=None,
-        data_loader=modules["data"],
-        dataset_transformation=modules["data"],
-        environments_utils=modules["data"],
-        grpo_fast=modules["data"],
-        grpo_utils=modules["data"],
-        ground_truth_utils=modules["data"],
-        model_utils=modules["data"],
-        rl_utils=modules["rl"],
-        utils=modules["data"],
-        vllm_utils=modules["data"],
-        weight_transfer=None,
+        ray=ray or _FakeRay(),
+        ray_queue=fake,
+        data_loader=fake,
+        dataset_transformation=fake,
+        environments_utils=fake,
+        grpo_fast=fake,
+        grpo_utils=fake,
+        ground_truth_utils=fake,
+        model_utils=fake,
+        rl_utils=rl,
+        utils=fake,
+        vllm_utils=fake,
+        weight_transfer=weight_transfer,
     )
 
 
@@ -488,28 +613,15 @@ def test_serialization_refuses_missing_behavior_logprobs() -> None:
 
 def test_mocked_orchestration_collects_and_shards_updates(tmp_path: Path) -> None:
     # The fixed-corpus loop collects each update and appends its shard.
-    api = _api()
-    session = CollectionSession(
-        api=api,
-        tokenizer=None,
-        dataset=None,
-        iter_dataloader=None,
-        inference_queue=None,
-        prompt_queue=None,
-        generation_config=None,
-        base_env_config=None,
-        model_dims=None,
-        engines=[],
-        pools={},
-        started_ray=False,
-    )
+    session = _sync_session([], _api())
     calls: list[int] = []
 
     def collect(
-        _session: CollectionSession,
-        _config: RunnerConfig,
+        session: CollectionSession,
+        config: RunnerConfig,
         step: int,
     ) -> tuple[_FakeBatch, _FakeResult, list[float]]:
+        del session, config
         calls.append(step)
         return _batch(), _result(), [-0.5, 0.5]
 
@@ -548,10 +660,11 @@ def test_fixed_collection_recovers_an_incomplete_final_update(
     calls: list[int] = []
 
     def collect(
-        _session: CollectionSession,
-        _config: RunnerConfig,
+        session: CollectionSession,
+        config: RunnerConfig,
         step: int,
     ) -> tuple[_FakeBatch, _FakeResult, list[float]]:
+        del session, config
         calls.append(step)
         return _batch(), _result(), [-0.5, 0.5]
 
@@ -858,7 +971,6 @@ def test_prime_prompts_fills_the_configured_inflight_window() -> None:
     prompt_queue = object()
     generation_config = object()
     base_env_config = object()
-    data = ModuleType("data")
 
     def add_prompt_to_generator(
         example: dict[str, int],
@@ -880,9 +992,15 @@ def test_prime_prompts_fills_the_configured_inflight_window() -> None:
             ),
         )
 
-    vars(data)["add_prompt_to_generator"] = add_prompt_to_generator
-    session = _sync_session([], replace(_api(), data_loader=data))
-    session.iter_dataloader = iter({"index": index} for index in range(6))
+    session = _sync_session(
+        [],
+        _api(
+            upstream_modules=_FakeUpstream(
+                add_prompt_to_generator=add_prompt_to_generator,
+            ),
+        ),
+        loader=_FakeLoader({"index": index} for index in range(6)),
+    )
     session.prompt_queue = prompt_queue
     session.generation_config = generation_config
     session.base_env_config = base_env_config
@@ -906,22 +1024,22 @@ def test_run_primes_collects_and_closes_its_ray_runtime(
 ) -> None:
     events: list[str] = []
     paths = [tmp_path / "rollouts.jsonl"]
-    ray = SimpleNamespace(
-        is_initialized=lambda: True,
-        shutdown=lambda: events.append("shutdown"),
-    )
-    api = replace(_api(), ray=ray)
+    ray = _FakeRay(events=events)
+    api = _api(ray=ray)
     session = _sync_session([], api)
     session.started_ray = True
 
-    def build(_config: RunnerConfig, _api: UpstreamApi) -> CollectionSession:
+    def build(config: RunnerConfig, api: UpstreamApi) -> CollectionSession:
+        del config, api
         events.append("build")
         return session
 
-    def prime(_config: RunnerConfig, _session: CollectionSession) -> None:
+    def prime(config: RunnerConfig, session: CollectionSession) -> None:
+        del config, session
         events.append("prime")
 
-    def collect(_config: RunnerConfig, _session: CollectionSession) -> list[Path]:
+    def collect(config: RunnerConfig, session: CollectionSession) -> list[Path]:
+        del config, session
         events.append("collect")
         return paths
 
@@ -942,8 +1060,9 @@ def test_run_resolves_paths_before_loading_upstream(
 
     def load(
         root: Path | str | None,
-        _runtime_policy: RayRuntimePolicy,
+        runtime_policy: RayRuntimePolicy,
     ) -> UpstreamApi:
+        del runtime_policy
         observed.append(root)
         raise RuntimeError("stop after observing the path")
 
@@ -975,12 +1094,13 @@ def test_runner_uses_the_prepared_dataset_and_task_assets() -> None:
 def test_runner_cli_resolves_defaults_under_base_dir(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     captured: list[RunnerConfig] = []
 
     def run(config: RunnerConfig) -> list[Path]:
         captured.append(config)
-        return []
+        return [tmp_path / "shard.jsonl"]
 
     monkeypatch.setattr(runner_module, "run", run)
     monkeypatch.setattr(
@@ -989,6 +1109,7 @@ def test_runner_cli_resolves_defaults_under_base_dir(
     )
 
     assert runner_module.main() == 0
+    assert capsys.readouterr().out == f"{tmp_path / 'shard.jsonl'}\n"
     assert len(captured) == 1
     config = captured[0]
     assert config.working_dir == tmp_path / "runs/tmax/exp000"
@@ -999,7 +1120,7 @@ def test_runner_cli_resolves_defaults_under_base_dir(
 
 def test_session_refuses_missing_pinned_dataset_assets(tmp_path: Path) -> None:
     # File checks use the finalized copy without mutating the caller's config.
-    api = replace(_api(), ray=SimpleNamespace(is_initialized=lambda: True))
+    api = _api()
     config = RunnerConfig(base_dir=tmp_path)
     with pytest.raises(FileNotFoundError, match="training rows") as error:
         build_session(config, api)
@@ -1027,33 +1148,15 @@ def test_session_failure_only_shuts_down_owned_ray(
     dataset.write_text("rows", encoding="utf-8")
     tasks = tmp_path / "tasks"
     tasks.mkdir()
-    initialized = already_initialized
-    events: list[str] = []
-
-    def is_initialized() -> bool:
-        return initialized
-
-    def init(**_kwargs: object) -> None:
-        nonlocal initialized
-        initialized = True
-
-    def shutdown() -> None:
-        nonlocal initialized
-        events.append("shutdown")
-        initialized = False
-
-    ray = SimpleNamespace(
-        is_initialized=is_initialized,
-        init=init,
-        shutdown=shutdown,
-        get_runtime_context=lambda: SimpleNamespace(
-            runtime_env={"env_vars": RayRuntimePolicy().env_vars()},
-        ),
+    ray = _FakeRay(
+        initialized=already_initialized,
+        runtime_env={"env_vars": RayRuntimePolicy().env_vars()},
     )
-    api = replace(_api(), ray=ray)
+    api = _api(ray=ray)
     config = RunnerConfig(dataset_path=dataset, task_data_dir=tasks)
 
-    def fail(_checkpoint: Path, _ray: object) -> None:
+    def fail(checkpoint: Path, ray: object) -> None:
+        del checkpoint, ray
         raise RuntimeError("setup failed")
 
     monkeypatch.setattr(runner_module, "_require_checkpoint_on_ray_nodes", fail)
@@ -1061,7 +1164,7 @@ def test_session_failure_only_shuts_down_owned_ray(
     with pytest.raises(RuntimeError, match="setup failed"):
         build_session(config, api)
 
-    assert events == ["shutdown"] * shutdowns
+    assert ray.events == ["shutdown"] * shutdowns
 
 
 def test_the_qwen35_namespace_mapper_matches_upstream() -> None:
@@ -1089,7 +1192,7 @@ def test_weight_sync_maps_names_for_metadata_and_tensors_alike() -> None:
         tensor_parallel_size=1,
         name_mapper=vllm_weight_name_mapper("Qwen3.5-4B"),
     )
-    sync.initialize(node_ip="127.0.0.1", port=29500)
+    sync.initialize(node_ip="127.0.0.1", port=29_500)
     sync(
         [
             ("model.embed_tokens.weight", torch.zeros(2, 3)),
@@ -1113,7 +1216,7 @@ def test_weight_sync_without_a_mapper_sends_names_unchanged() -> None:
     sent: list[tuple[str, torch.Tensor]] = []
     api = _sync_api(sent)
     sync = WeightSync(_sync_session(engines, api), tensor_parallel_size=1)
-    sync.initialize(node_ip="127.0.0.1", port=29500)
+    sync.initialize(node_ip="127.0.0.1", port=29_500)
     sync([("model.embed_tokens.weight", torch.zeros(2, 3))], model_step=0)
     assert sent[0][0] == "model.embed_tokens.weight"
 
@@ -1126,7 +1229,7 @@ def test_weight_sync_gates_admissions_and_reopens_after_success() -> None:
     session = _sync_session([engine], api)
     manager = cast(_ActorManager, session.actor_manager)
     sync = WeightSync(session, tensor_parallel_size=1)
-    sync.initialize(node_ip="127.0.0.1", port=29500)
+    sync.initialize(node_ip="127.0.0.1", port=29_500)
     engine.events.clear()
     sync([("weight", torch.zeros(2))], model_step=7)
     assert manager.events == [("gate", True), ("gate", False)]
@@ -1149,7 +1252,7 @@ def test_weight_sync_failure_wakes_reopens_and_does_not_advance() -> None:
     session = _sync_session([engine], api)
     manager = cast(_ActorManager, session.actor_manager)
     sync = WeightSync(session, tensor_parallel_size=1)
-    sync.initialize(node_ip="127.0.0.1", port=29500)
+    sync.initialize(node_ip="127.0.0.1", port=29_500)
     engine.events.clear()
     with pytest.raises(RuntimeError, match="primary"):
         sync([("weight", torch.zeros(2))], model_step=8)
@@ -1160,11 +1263,52 @@ def test_weight_sync_failure_wakes_reopens_and_does_not_advance() -> None:
         sync([("weight", torch.zeros(2))], model_step=8)
 
 
+def test_weight_sync_requires_initialization() -> None:
+    sync = WeightSync(_sync_session([_Engine()], _sync_api([])), tensor_parallel_size=1)
+    with pytest.raises(RuntimeError, match="initialize must run before a sync"):
+        sync([("weight", torch.zeros(2))], model_step=0)
+
+
+def test_weight_sync_cannot_initialize_without_a_transfer_engine() -> None:
+    sync = WeightSync(_sync_session([_Engine()], _api()), tensor_parallel_size=1)
+    with pytest.raises(RuntimeError, match="no weight-transfer engine"):
+        sync.initialize(node_ip="127.0.0.1", port=29_500)
+
+
+def test_weight_sync_cannot_reinitialize_after_a_failed_transfer() -> None:
+    engine = _Engine()
+    engine.update_weights = _Rpc(
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("primary")),
+    )
+    sync = WeightSync(_sync_session([engine], _sync_api([])), tensor_parallel_size=1)
+    sync.initialize(node_ip="127.0.0.1", port=29_500)
+    with pytest.raises(RuntimeError, match="primary"):
+        sync([("weight", torch.zeros(2))], model_step=1)
+    with pytest.raises(RuntimeError, match="unusable after a failed transfer"):
+        sync.initialize(node_ip="127.0.0.1", port=29_500)
+
+
+def test_weight_sync_assigns_each_engine_its_rank_offset() -> None:
+    engines = [_Engine(), _Engine()]
+    sync = WeightSync(_sync_session(engines, _sync_api([])), tensor_parallel_size=2)
+    sync.initialize(node_ip="10.0.0.9", port=1234)
+    requests = [
+        cast("dict[str, object]", payload)
+        for engine in engines
+        for name, payload in engine.events
+        if name == "init"
+    ]
+    assert [
+        cast("dict[str, object]", request["init_info"])["rank_offset"]
+        for request in requests
+    ] == [1, 3]
+    assert cast("dict[str, object]", requests[0]["init_info"])["world_size"] == 5
+
+
 def test_collection_reports_to_the_session_actor_manager() -> None:
     # Upstream receives the session's actor manager and chosen age limit.
     seen: list[object] = []
     age_limits: list[int | None] = []
-    data = ModuleType("data")
 
     def accumulate(
         *_args: object,
@@ -1176,22 +1320,25 @@ def test_collection_reports_to_the_session_actor_manager() -> None:
         age_limits.append(max_result_age_steps)
         return _result(), _batch(), None, None
 
-    vars(data)["accumulate_inference_batches"] = accumulate
+    def compute_group_advantages(**_kwargs: object) -> np.ndarray:
+        return np.array([-0.5, 0.5])
 
-    def compute_group_advantages(**_kwargs: object) -> torch.Tensor:
-        return torch.tensor([-0.5, 0.5])
-
-    vars(data)["compute_group_advantages"] = compute_group_advantages
-    api = replace(_api(), data_loader=data)
+    api = _api(
+        upstream_modules=_FakeUpstream(
+            accumulate_inference_batches=accumulate,
+            compute_group_advantages=compute_group_advantages,
+        ),
+    )
     session = _sync_session([], api)
-    collect_update(
+    records = records_for_update(
         session,
         RunnerConfig(num_prompts=1, samples_per_prompt=2),
         5,
-        max_result_age_steps=None,
+        max_result_age_steps=3,
     )
-    assert seen == [cast(object, session.actor_manager)]
-    assert age_limits == [None]
+    assert seen == [session.actor_manager]
+    assert age_limits == [3]
+    assert [record["advantage"] for record in records] == [-0.5, 0.5]
 
 
 if __name__ == "__main__":

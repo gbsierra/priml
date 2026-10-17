@@ -1,4 +1,9 @@
-"""Run one Terminal-Bench evaluation for an exported TMax checkpoint.
+#!/bin/sh
+# ruff: noqa: EXE003, D300, D205 -- Polyglot shell/Python script.
+# fmt: off
+'''' 2>/dev/null #
+exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 "$0" "$@"
+Run one Terminal-Bench evaluation for an exported TMax checkpoint.
 
 vLLM serves the model. Harbor runs Terminal-Bench with TMax's Vanillux agent
 and task verifiers. TMax's ``compute_stats.py`` aggregates the rewards and
@@ -8,14 +13,17 @@ This module starts and stops vLLM, runs Harbor, copies its results, and records
 the checkpoint and evaluation settings. Its defaults match the main settings
 from TMax's manual Qwen3.5 command. It runs one job, not the complete multi-run
 evaluation reported in the paper.
-"""
+'''
+# fmt: on
+
 
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Final, Protocol, cast
+from urllib import request
 
 import argparse
 import hashlib
@@ -24,8 +32,8 @@ import os
 import shutil
 import subprocess
 import time
-import urllib.error
-import urllib.request
+
+from treekle import from_plain, json_loads
 
 from priml.baselines.tmax.scripts import upstream
 from priml.paths import resolve_working_dir
@@ -35,45 +43,34 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 
-class _Flags(Protocol):
-    """Parsed command-line flags."""
+class _HttpResponse(Protocol):
+    """The part of an ``urlopen`` response the readiness probe reads."""
 
-    base_dir: Path
-    working_dir: Path
-    checkpoint: Path
-    results_dir: Path
-    job_name: str
-    dataset: str
-    gpus: int
-    n_concurrent: int
-    n_attempts: int
-    n_tasks: int | None
-    environment: str
-    tool_call_parser: str
-    max_format_errors: int
-    port: int
-    tensor_parallel_size: int | None
-    data_parallel_size: int
-    max_model_len: int | None
-    upstream_root: Path
+    def read(self) -> bytes:
+        """Return the response body."""
+        ...
+
+    def close(self) -> None:
+        """Release the connection."""
+        ...
 
 
-VLLM_VERSION = "0.19.1"
+VLLM_VERSION: Final = "0.19.1"
 """vLLM version used by TMax's evaluation command."""
-DAYTONA_VERSION = "0.165.0"
+DAYTONA_VERSION: Final = "0.165.0"
 """Minimum Daytona SDK release required by TMax's locked Harbor 0.6.6."""
-TOOL_CALL_PARSER = "qwen3_xml"
+TOOL_CALL_PARSER: Final = "qwen3_xml"
 """Tool-call parser used for Qwen3.5."""
-DATASET = "terminal-bench@2.0"
+DATASET: Final = "terminal-bench@2.0"
 """Dataset used by TMax's manual evaluation command."""
-AGENT_IMPORT_PATH = "Vanillux2Agent:Vanillux2Agent"
-ENVIRONMENT = "daytona"
-N_CONCURRENT = 16
-N_ATTEMPTS = 5
-MAX_FORMAT_ERRORS = 64
+AGENT_IMPORT_PATH: Final = "Vanillux2Agent:Vanillux2Agent"
+ENVIRONMENT: Final = "daytona"
+N_CONCURRENT: Final = 16
+N_ATTEMPTS: Final = 5
+MAX_FORMAT_ERRORS: Final = 64
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class EvalConfig:
     """Settings for one Terminal-Bench job."""
 
@@ -154,7 +151,15 @@ class EvalConfig:
 
 
 def build_vllm_command(config: EvalConfig) -> list[str]:
-    """Build the vLLM command."""
+    """Build the vLLM command.
+
+    Args:
+      config: The evaluation settings.
+
+    Returns:
+      command: The ``vllm serve`` argv.
+
+    """
     command = [
         "uvx",
         "--with",
@@ -187,7 +192,15 @@ def build_vllm_command(config: EvalConfig) -> list[str]:
 
 
 def build_harbor_command(config: EvalConfig) -> list[str]:
-    """Build the Harbor command."""
+    """Build the Harbor command.
+
+    Args:
+      config: The evaluation settings.
+
+    Returns:
+      command: The ``harbor run`` argv.
+
+    """
     command = [
         "uv",
         "run",
@@ -230,7 +243,15 @@ def build_harbor_command(config: EvalConfig) -> list[str]:
 
 
 def build_stats_command(config: EvalConfig) -> list[str]:
-    """Build the TMax metrics command."""
+    """Build the TMax metrics command.
+
+    Args:
+      config: The evaluation settings.
+
+    Returns:
+      command: The ``compute_stats.py`` argv.
+
+    """
     return [
         "uv",
         "run",
@@ -242,19 +263,6 @@ def build_stats_command(config: EvalConfig) -> list[str]:
     ]
 
 
-def _harbor_environment(config: EvalConfig) -> dict[str, str]:
-    """Set the local vLLM environment expected by Harbor and its agents.
-
-    Vanillux also receives the local API address directly. These variables
-    support Harbor adapters that read the address from the environment.
-    """
-    environment = dict(os.environ)
-    environment.setdefault("OPENAI_API_KEY", "dummy")
-    environment["OPENAI_API_BASE"] = f"http://localhost:{config.port}/v1"
-    environment["OPENAI_BASE_URL"] = f"http://localhost:{config.port}/v1"
-    return environment
-
-
 def run(
     config: EvalConfig,
     *,
@@ -262,7 +270,18 @@ def run(
     run_command: Callable[..., subprocess.CompletedProcess[bytes]] = subprocess.run,
     sleep: Callable[[float], None] = time.sleep,
 ) -> Path:
-    """Serve the model, run the evaluation, compute metrics, and stop vLLM."""
+    """Serve the model, run the evaluation, compute metrics, and stop vLLM.
+
+    Args:
+      config: The evaluation settings.
+      popen: Starts the vLLM server; injected by tests.
+      run_command: Runs Harbor and the stats script; injected by tests.
+      sleep: Waits between readiness polls; injected by tests.
+
+    Returns:
+      metrics_path: The written ``metrics.json``.
+
+    """
     checkpoint_files = _checkpoint_files(config.checkpoint)
     checkpoint_identity = _checkpoint_identity(checkpoint_files)
     config = replace(
@@ -326,6 +345,175 @@ def run(
             raise
         finally:
             _stop_server(server)
+
+
+def wait_for_server(
+    port: int,
+    served_name: str,
+    *,
+    server: subprocess.Popen[bytes] | None = None,
+    timeout: float = 1_800.0,
+    interval: float = 1.0,
+    sleep: Callable[[float], None] = time.sleep,
+    urlopen: Callable[..., _HttpResponse] = request.urlopen,
+) -> None:
+    """Wait until vLLM lists the requested model.
+
+    Args:
+      port: Local port vLLM serves on.
+      served_name: Model name vLLM must list.
+      server: The vLLM process, polled for an early exit.
+      timeout: Seconds to wait before giving up.
+      interval: Seconds between polls.
+      sleep: Waits between polls; injected by tests.
+      urlopen: Opens the models endpoint; injected by tests.
+
+    Raises:
+      RuntimeError: The server exited before serving the model.
+      TimeoutError: The model was not listed within ``timeout``.
+
+    """
+    deadline = time.monotonic() + timeout
+    url = f"http://localhost:{port}/v1/models"
+    while time.monotonic() < deadline:
+        if server is not None and server.poll() is not None:
+            raise RuntimeError(
+                f"vLLM exited before serving {served_name!r} on port {port}.",
+            )
+        ready = False
+        try:
+            response = urlopen(url, timeout=min(interval, 10.0))
+        except OSError:
+            response = None
+        if response is not None:
+            try:
+                models = from_plain(
+                    json_loads(response.read(), dict[str, object]).get("data"),
+                    list[dict[str, object]],
+                    default=[],
+                )
+                ready = any(model.get("id") == served_name for model in models)
+            except (OSError, ValueError):
+                pass
+            finally:
+                response.close()
+        if ready:
+            return
+        sleep(interval)
+    raise TimeoutError(
+        f"vLLM did not serve {served_name!r} at {url} within {timeout:.0f}s.",
+    )
+
+
+def main() -> int:
+    """Parse evaluation settings and run one job.
+
+    Returns:
+      exit_code: Zero on success.
+
+    """
+    parser = argparse.ArgumentParser(
+        description=__doc__.split("\n", 2)[2] if __doc__ else None,
+    )
+    _add_arguments(parser)
+    flags = cast(_Flags, parser.parse_args())
+    working_dir = resolve_working_dir(flags.base_dir, flags.working_dir)
+    checkpoint = resolve_working_dir(working_dir, flags.checkpoint)
+    results_dir = resolve_working_dir(working_dir, flags.results_dir)
+    upstream_root = resolve_working_dir(flags.base_dir, flags.upstream_root)
+    # Verify at launch so config construction stays side-effect-free.
+    tmax_root = upstream.verify_checkout(upstream_root)
+    path = run(
+        EvalConfig(
+            checkpoint=checkpoint,
+            results_dir=results_dir,
+            job_name=flags.job_name,
+            dataset=flags.dataset,
+            gpus=flags.gpus,
+            n_concurrent=flags.n_concurrent,
+            n_attempts=flags.n_attempts,
+            n_tasks=flags.n_tasks,
+            environment=flags.environment,
+            tool_call_parser=flags.tool_call_parser,
+            max_format_errors=flags.max_format_errors,
+            port=flags.port,
+            tensor_parallel_size=flags.tensor_parallel_size,
+            data_parallel_size=flags.data_parallel_size,
+            max_model_len=flags.max_model_len,
+            tmax_root=tmax_root,
+        ),
+    )
+    print(path)
+    return 0
+
+
+def _add_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--base-dir",
+        type=Path,
+        default=Path("/opt/scratch"),
+        help="Root for input assets and generated run files.",
+    )
+    parser.add_argument(
+        "--working-dir",
+        type=Path,
+        default=Path("/runs/tmax/exp000"),
+        help="Logical run directory below base-dir.",
+    )
+    parser.add_argument("checkpoint", type=Path)
+    parser.add_argument("--results-dir", type=Path, required=True)
+    parser.add_argument("--job-name", required=True)
+    parser.add_argument("--dataset", default=DATASET)
+    parser.add_argument("--gpus", type=int, default=8)
+    parser.add_argument("--n-concurrent", type=int, default=N_CONCURRENT)
+    parser.add_argument("--n-attempts", type=int, default=N_ATTEMPTS)
+    parser.add_argument("--n-tasks", type=int, default=None)
+    parser.add_argument("--environment", default=ENVIRONMENT)
+    parser.add_argument("--tool-call-parser", default=TOOL_CALL_PARSER)
+    parser.add_argument("--max-format-errors", type=int, default=MAX_FORMAT_ERRORS)
+    parser.add_argument("--port", type=int, default=8008)
+    parser.add_argument("--tensor-parallel-size", type=int, default=None)
+    parser.add_argument("--data-parallel-size", type=int, default=1)
+    parser.add_argument("--max-model-len", type=int, default=None)
+    parser.add_argument(
+        "--upstream-root",
+        type=Path,
+        default=Path("/datasets/tmax/upstream/tmax"),
+    )
+
+
+class _Flags(Protocol):
+    """Parsed command-line flags."""
+
+    base_dir: Path
+    working_dir: Path
+    checkpoint: Path
+    results_dir: Path
+    job_name: str
+    dataset: str
+    gpus: int
+    n_concurrent: int
+    n_attempts: int
+    n_tasks: int | None
+    environment: str
+    tool_call_parser: str
+    max_format_errors: int
+    port: int
+    tensor_parallel_size: int | None
+    data_parallel_size: int
+    max_model_len: int | None
+    upstream_root: Path
+
+
+# Vanillux also receives the local API address directly. These variables support Harbor
+# adapters that read the address from the environment.
+def _harbor_environment(config: EvalConfig) -> dict[str, str]:
+    """Set the local vLLM environment expected by Harbor and its agents."""
+    environment = dict(os.environ)
+    environment.setdefault("OPENAI_API_KEY", "dummy")
+    environment["OPENAI_API_BASE"] = f"http://localhost:{config.port}/v1"
+    environment["OPENAI_BASE_URL"] = f"http://localhost:{config.port}/v1"
+    return environment
 
 
 def _require_success(completed: subprocess.CompletedProcess[bytes]) -> None:
@@ -417,18 +605,14 @@ def _require_existing_job_identity(
             "PriML manifest; choose a fresh --job-name.",
         )
     try:
-        payload = cast(
-            object,
-            json.loads(config.provenance_path.read_text(encoding="utf-8")),
+        payload = json_loads(
+            config.provenance_path.read_text(encoding="utf-8"),
+            dict[str, object],
         )
-    except (OSError, json.JSONDecodeError) as error:
+    except (OSError, ValueError) as error:
         raise ValueError(
             f"Cannot read evaluation manifest {config.provenance_path}.",
         ) from error
-    if not isinstance(payload, Mapping):
-        raise TypeError(
-            f"Evaluation manifest {config.provenance_path} must be an object.",
-        )
     expected = _evaluation_identity(config, checkpoint_files)
     changed = sorted(
         key for key, value in expected.items() if payload.get(key) != value
@@ -509,65 +693,6 @@ def _write_provenance(
         os.close(descriptor)
 
 
-def wait_for_server(
-    port: int,
-    served_name: str,
-    *,
-    server: subprocess.Popen[bytes] | None = None,
-    timeout: float = 1_800.0,
-    interval: float = 1.0,
-    sleep: Callable[[float], None] = time.sleep,
-    urlopen: Callable[..., object] = urllib.request.urlopen,
-) -> None:
-    """Wait until vLLM lists the requested model."""
-    deadline = time.monotonic() + timeout
-    url = f"http://localhost:{port}/v1/models"
-    while time.monotonic() < deadline:
-        if server is not None and server.poll() is not None:
-            raise RuntimeError(
-                f"vLLM exited before serving {served_name!r} on port {port}.",
-            )
-        response: object | None = None
-        ready = False
-        try:
-            response = urlopen(url, timeout=min(interval, 10.0))
-            read = getattr(response, "read", None)
-            if callable(read):
-                payload = _decode_json_response(read())
-                if isinstance(payload, Mapping):
-                    models = payload.get("data")
-                    if isinstance(models, list):
-                        ready = any(
-                            isinstance(model, Mapping)
-                            and model.get("id") == served_name
-                            for model in cast("list[object]", models)
-                        )
-        except (
-            OSError,
-            TypeError,
-            ValueError,
-            urllib.error.URLError,
-        ):
-            pass
-        finally:
-            close = getattr(response, "close", None)
-            if callable(close):
-                close()
-        if ready:
-            return
-        sleep(interval)
-    raise TimeoutError(
-        f"vLLM did not serve {served_name!r} at {url} within {timeout:.0f}s.",
-    )
-
-
-def _decode_json_response(encoded: object) -> object:
-    """Decode a JSON response."""
-    if not isinstance(encoded, (str, bytes, bytearray)):
-        raise TypeError("The vLLM models response must be JSON bytes.")
-    return cast(object, json.loads(encoded))
-
-
 def _model_info(config: EvalConfig) -> str:
     """Build the model details passed to Harbor."""
     return json.dumps(
@@ -593,71 +718,6 @@ def _stop_server(server: subprocess.Popen[bytes]) -> None:
         server.wait(timeout=30)
 
 
-def main() -> int:
-    """Parse evaluation settings and run one job."""
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--base-dir",
-        type=Path,
-        default=Path("/opt/scratch"),
-        help="Root for input assets and generated run files.",
-    )
-    parser.add_argument(
-        "--working-dir",
-        type=Path,
-        default=Path("/runs/tmax/exp000"),
-        help="Logical run directory below base-dir.",
-    )
-    parser.add_argument("checkpoint", type=Path)
-    parser.add_argument("--results-dir", type=Path, required=True)
-    parser.add_argument("--job-name", required=True)
-    parser.add_argument("--dataset", default=DATASET)
-    parser.add_argument("--gpus", type=int, default=8)
-    parser.add_argument("--n-concurrent", type=int, default=N_CONCURRENT)
-    parser.add_argument("--n-attempts", type=int, default=N_ATTEMPTS)
-    parser.add_argument("--n-tasks", type=int, default=None)
-    parser.add_argument("--environment", default=ENVIRONMENT)
-    parser.add_argument("--tool-call-parser", default=TOOL_CALL_PARSER)
-    parser.add_argument("--max-format-errors", type=int, default=MAX_FORMAT_ERRORS)
-    parser.add_argument("--port", type=int, default=8008)
-    parser.add_argument("--tensor-parallel-size", type=int, default=None)
-    parser.add_argument("--data-parallel-size", type=int, default=1)
-    parser.add_argument("--max-model-len", type=int, default=None)
-    parser.add_argument(
-        "--upstream-root",
-        type=Path,
-        default=Path("/datasets/tmax/upstream/tmax"),
-    )
-    flags = cast(_Flags, parser.parse_args())
-    working_dir = resolve_working_dir(flags.base_dir, flags.working_dir)
-    checkpoint = resolve_working_dir(working_dir, flags.checkpoint)
-    results_dir = resolve_working_dir(working_dir, flags.results_dir)
-    upstream_root = resolve_working_dir(flags.base_dir, flags.upstream_root)
-    # Verify at launch so config construction stays side-effect-free.
-    tmax_root = upstream.verify_checkout(upstream_root)
-    path = run(
-        EvalConfig(
-            checkpoint=checkpoint,
-            results_dir=results_dir,
-            job_name=flags.job_name,
-            dataset=flags.dataset,
-            gpus=flags.gpus,
-            n_concurrent=flags.n_concurrent,
-            n_attempts=flags.n_attempts,
-            n_tasks=flags.n_tasks,
-            environment=flags.environment,
-            tool_call_parser=flags.tool_call_parser,
-            max_format_errors=flags.max_format_errors,
-            port=flags.port,
-            tensor_parallel_size=flags.tensor_parallel_size,
-            data_parallel_size=flags.data_parallel_size,
-            max_model_len=flags.max_model_len,
-            tmax_root=tmax_root,
-        ),
-    )
-    print(path)
-    return 0
-
-
 if __name__ == "__main__":
     raise SystemExit(main())
+# vim: ft=python

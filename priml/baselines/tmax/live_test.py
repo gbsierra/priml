@@ -4,22 +4,25 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, NoReturn, cast
 
 import pytest
+import torch
 
 from priml.baselines.tmax import live as live_module
+from priml.baselines.tmax.data import TMaxRolloutData
 from priml.baselines.tmax.live import LiveTMaxRolloutData, _records_from_payload
 from priml.baselines.tmax.rollouts import RolloutRecord
+from priml.baselines.tmax.scripts.rollout_writer import RolloutWriter
 from priml.baselines.tmax.scripts.runner import (
     CollectionSession,
-    RolloutWriter,
     RunnerConfig,
 )
+from priml.baselines.tmax.scripts.weight_sync import WeightSync
 
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Iterable, Mapping, Sequence
 
     from priml.train.custom_types import TrainStepProtocol
 
@@ -228,7 +231,8 @@ def test_live_runtime_primes_prompts_after_the_weight_sync(
     events: list[str] = []
     captured: dict[str, object] = {}
 
-    def load_api(_root: object, _policy: object) -> object:
+    def load_api(root: object, policy: object) -> object:
+        del root, policy
         return SimpleNamespace(
             ray=SimpleNamespace(
                 _private=SimpleNamespace(
@@ -237,10 +241,11 @@ def test_live_runtime_primes_prompts_after_the_weight_sync(
                     ),
                 ),
             ),
-            utils=SimpleNamespace(find_free_port=lambda: 29500),
+            utils=SimpleNamespace(find_free_port=lambda: 29_500),
         )
 
-    def build(_runner: object, _api: object) -> object:
+    def build(runner: object, api: object) -> object:
+        del runner, api
         events.append("build")
 
         def load_state_dict(state: Mapping[str, object]) -> None:
@@ -255,11 +260,12 @@ def test_live_runtime_primes_prompts_after_the_weight_sync(
     class _WeightSync:
         def __init__(
             self,
-            _session: object,
+            session: object,
             *,
             tensor_parallel_size: int,
             name_mapper: object = None,
         ) -> None:
+            del session
             captured["tensor_parallel_size"] = tensor_parallel_size
             captured["name_mapper"] = name_mapper
             events.append("sync-construct")
@@ -270,25 +276,29 @@ def test_live_runtime_primes_prompts_after_the_weight_sync(
             events.append("sync-initialize")
 
     class _Writer:
-        def __init__(self, _directory: object, _run_name: str) -> None:
-            pass
+        def __init__(self, directory: object, run_name: str) -> None:
+            del directory, run_name
 
-        def committed_live_steps(self, _records: int) -> set[int]:
+        def committed_live_steps(self, records: int) -> set[int]:
+            del records
             return {0}
 
-        def live_cursor_after(self, step: int, _records: int) -> dict[str, int]:
+        def live_cursor_after(self, step: int, records: int) -> dict[str, int]:
+            del records
             assert step == 0
             return {"position": 10}
 
         def recover_uncommitted_live_tail(
             self,
             first_missing_step: int,
-            _records: int,
+            records: int,
         ) -> set[int]:
+            del records
             assert first_missing_step == 1
             return set()
 
-    def prime(_runner: object, _session: object) -> int:
+    def prime(runner: object, session: object) -> int:
+        del runner, session
         events.append("prime")
         return 1
 
@@ -383,10 +393,12 @@ def test_live_replays_committed_step_without_priming(
     data._session = cast(CollectionSession, cast(object, SimpleNamespace()))
     replayed = [cast("dict[str, object]", asdict(record)) for record in _records(0)]
 
-    def committed_live_steps(_count: int) -> set[int]:
+    def committed_live_steps(count: int) -> set[int]:
+        del count
         return {0}
 
-    def records_for_step(_step: int, _count: int) -> list[dict[str, object]]:
+    def records_for_step(step: int, count: int) -> list[dict[str, object]]:
+        del step, count
         return replayed
 
     data._writer = cast(
@@ -437,14 +449,16 @@ def test_live_primes_once_and_commits_captured_cursor(
     )
     commits: list[tuple[int, object]] = []
 
-    def committed_live_steps(_count: int) -> set[int]:
+    def committed_live_steps(count: int) -> set[int]:
+        del count
         return set()
 
     def write_live(
         step: int,
-        _records: Sequence[Mapping[str, object]],
+        records: Sequence[Mapping[str, object]],
         prompt_loader_state_after: Mapping[str, object],
     ) -> None:
+        del records
         commits.append((step, prompt_loader_state_after))
 
     data._writer = cast(
@@ -471,13 +485,14 @@ def test_live_primes_once_and_commits_captured_cursor(
     )
 
     def records_for_update(
-        _session: CollectionSession,
-        _runner: RunnerConfig,
+        session: CollectionSession,
+        runner: RunnerConfig,
         step: int,
         *,
         max_result_age_steps: int | None,
     ) -> list[dict[str, object]]:
-        assert max_result_age_steps == _runner.async_steps
+        del session
+        assert max_result_age_steps == runner.async_steps
         return [cast("dict[str, object]", asdict(record)) for record in _records(step)]
 
     monkeypatch.setattr(
@@ -493,6 +508,340 @@ def test_live_primes_once_and_commits_captured_cursor(
     assert primes == [1]
     assert commits == [(0, {"position": 1}), (1, {"position": 2})]
     assert data.state_dict()["prompt_loader"] == {"position": 2}
+
+
+def _live_data(*, num_updates: int = 2, start_step: int = 0) -> LiveTMaxRolloutData:
+    """Build a two-sample live dataset whose runtime is never started."""
+    data = LiveTMaxRolloutData.Config(
+        working_dir="/unused",
+        records_per_update=2,
+        num_samples_per_prompt=2,
+        runner=RunnerConfig(
+            num_updates=num_updates,
+            start_step=start_step,
+            num_prompts=1,
+            samples_per_prompt=2,
+        ),
+    ).make()
+    assert isinstance(data, LiveTMaxRolloutData)
+    return data
+
+
+class _ExportingStep:
+    """A bound train step that records every HF-state gather."""
+
+    def __init__(self, global_step: int = 0) -> None:
+        self.pad_token_id = 0
+        self.global_step = global_step
+        self.gathers = 0
+
+    def hf_state_dict(self) -> dict[str, torch.Tensor]:
+        self.gathers += 1
+        return {"w": torch.zeros(1)}
+
+
+class _RecordingSync:
+    """Stands in for ``WeightSync``; records the steps it pushed."""
+
+    def __init__(self) -> None:
+        self.steps: list[int] = []
+
+    def __call__(
+        self,
+        weights: Iterable[tuple[str, torch.Tensor]],
+        *,
+        model_step: int,
+    ) -> None:
+        assert [name for name, _ in weights] == ["w"]
+        self.steps.append(model_step)
+
+
+def _bound(data: LiveTMaxRolloutData, step: object) -> None:
+    data.bind_step(cast("TrainStepProtocol", step))
+
+
+def test_live_loader_requires_a_bound_step() -> None:
+    with pytest.raises(RuntimeError, match="bound to a train step"):
+        next(iter(_live_data().train_dataloader()))
+
+
+def test_runtime_start_requires_a_bound_step() -> None:
+    with pytest.raises(RuntimeError, match="bound to a train step"):
+        _live_data()._ensure_runtime()
+
+
+def test_runtime_start_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
+    data = _live_data()
+    data._runtime_started = True
+    monkeypatch.setattr(live_module, "load_upstream_api", _never)
+    data._ensure_runtime()
+
+
+def test_runtime_rejects_a_resume_before_start_step() -> None:
+    data = _live_data(start_step=3)
+    _bound(data, _ExportingStep(global_step=1))
+    with pytest.raises(ValueError, match="before the configured rollout start_step"):
+        data._ensure_runtime()
+
+
+def test_runtime_rejects_a_different_update_size() -> None:
+    data = _live_data()
+    data.config.records_per_update = 4
+    _bound(data, _ExportingStep())
+    with pytest.raises(ValueError, match="records_per_update"):
+        data._ensure_runtime()
+
+
+def _never(*_args: object, **_kwargs: object) -> NoReturn:
+    raise AssertionError("must not be called")
+
+
+class _GapWriter:
+    """A writer whose commit markers skip step 1."""
+
+    def __init__(self, directory: object, run_name: str) -> None:
+        del directory, run_name
+
+    def committed_live_steps(self, records: int) -> set[int]:
+        del records
+        return {0, 2}
+
+    def live_cursor_after(self, step: int, records: int) -> dict[str, int]:
+        del step, records
+        return {"position": 1}
+
+
+class _ReplayWriter:
+    """A writer holding fixed committed steps and their replayed records."""
+
+    def __init__(
+        self,
+        *,
+        committed: set[int],
+        replayed: list[dict[str, object]] | None = None,
+    ) -> None:
+        self.committed = committed
+        self.replayed = replayed or []
+
+    def committed_live_steps(self, records_per_update: int) -> set[int]:
+        del records_per_update
+        return self.committed
+
+    def records_for_step(
+        self,
+        step: int,
+        records_per_update: int,
+    ) -> list[dict[str, object]]:
+        del step, records_per_update
+        return self.replayed
+
+
+class _StubSync:
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        pass
+
+    def initialize(self, *, node_ip: str, port: int) -> None:
+        del node_ip, port
+
+
+def test_runtime_rejects_non_consecutive_commit_markers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data = _live_data()
+    _bound(data, _ExportingStep())
+    api = SimpleNamespace(
+        ray=SimpleNamespace(
+            _private=SimpleNamespace(
+                services=SimpleNamespace(get_node_ip_address=lambda: "127.0.0.1"),
+            ),
+        ),
+        utils=SimpleNamespace(find_free_port=lambda: 29_500),
+    )
+
+    def load_api(*_args: object) -> object:
+        return api
+
+    def build(*_args: object) -> object:
+        return SimpleNamespace()
+
+    monkeypatch.setattr(live_module, "is_rank_zero", lambda: True)
+    monkeypatch.setattr(live_module, "load_upstream_api", load_api)
+    monkeypatch.setattr(live_module, "build_session", build)
+    monkeypatch.setattr(live_module, "WeightSync", _StubSync)
+    monkeypatch.setattr(live_module, "RolloutWriter", _GapWriter)
+    with pytest.raises(ValueError, match=r"first gap is 1.*\[2\]"):
+        data._ensure_runtime()
+
+
+def test_non_zero_rank_adopts_rank_zeros_replay_frontier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data = _live_data()
+    _bound(data, _ExportingStep())
+
+    def broadcast(payload: list[object], *, src: int) -> None:
+        assert src == 0
+        payload[0] = 3
+
+    monkeypatch.setattr(live_module, "is_rank_zero", lambda: False)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "broadcast_object_list", broadcast)
+    monkeypatch.setattr(data, "_sync_latest_policy", lambda: None)
+    data._ensure_runtime()
+    assert data._first_missing_step == 3
+    assert data._runtime_started
+
+
+def test_non_zero_rank_receives_the_broadcast_records(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data = _live_data()
+    sent = [asdict(record) for record in _records(4)]
+
+    def broadcast(payload: list[object], *, src: int) -> None:
+        assert src == 0
+        payload[0] = sent
+
+    monkeypatch.setattr(live_module, "is_rank_zero", lambda: False)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "broadcast_object_list", broadcast)
+    assert data._records_for_next_step() == _records(4)
+
+
+def test_rank_zero_collection_requires_a_started_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(live_module, "is_rank_zero", lambda: True)
+    with pytest.raises(RuntimeError, match="not initialized"):
+        _live_data()._records_for_next_step()
+
+
+def test_fresh_collection_must_be_the_first_missing_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data = _live_data()
+    data._session = cast(CollectionSession, cast(object, SimpleNamespace()))
+    data._writer = cast(RolloutWriter, cast(object, _ReplayWriter(committed=set())))
+    data._next_step = 1
+    data._first_missing_step = 0
+    monkeypatch.setattr(live_module, "is_rank_zero", lambda: True)
+    with pytest.raises(ValueError, match="Expected first missing live rollout step 0"):
+        data._records_for_next_step()
+
+
+def test_rank_zero_broadcasts_the_records_it_returns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data = _live_data()
+    data._session = cast(CollectionSession, cast(object, SimpleNamespace()))
+    replayed = [asdict(record) for record in _records(0)]
+    data._writer = cast(
+        RolloutWriter,
+        cast(object, _ReplayWriter(committed={0}, replayed=replayed)),
+    )
+    broadcasts: list[tuple[int, object]] = []
+
+    def broadcast(payload: list[object], *, src: int) -> None:
+        broadcasts.append((src, payload[0]))
+
+    monkeypatch.setattr(live_module, "is_rank_zero", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "broadcast_object_list", broadcast)
+    assert data._records_for_next_step() == _records(0)
+    assert broadcasts == [(0, replayed)]
+
+
+def test_policy_sync_pushes_the_gathered_state_from_rank_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data = _live_data()
+    step = _ExportingStep(global_step=7)
+    _bound(data, step)
+    sync = _RecordingSync()
+    data._weight_sync = cast(WeightSync, cast(object, sync))
+    monkeypatch.setattr(live_module, "is_rank_zero", lambda: True)
+    data._sync_latest_policy()
+    assert step.gathers == 1
+    assert sync.steps == [7]
+    assert data._synced_model_step == 7
+
+
+def test_policy_sync_gathers_on_every_rank_but_sends_only_from_rank_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data = _live_data()
+    step = _ExportingStep(global_step=2)
+    _bound(data, step)
+    monkeypatch.setattr(live_module, "is_rank_zero", lambda: False)
+    data._sync_latest_policy()
+    assert step.gathers == 1
+    assert data._synced_model_step == 2
+
+
+def test_policy_sync_requires_an_exporting_step() -> None:
+    data = _live_data()
+    _bound(data, SimpleNamespace(pad_token_id=0, global_step=0))
+    with pytest.raises(TypeError, match="exporting HF weights"):
+        data._sync_latest_policy()
+
+
+def test_policy_sync_requires_an_initialized_weight_sync(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data = _live_data()
+    _bound(data, _ExportingStep())
+    monkeypatch.setattr(live_module, "is_rank_zero", lambda: True)
+    with pytest.raises(RuntimeError, match="weight sync is not initialized"):
+        data._sync_latest_policy()
+
+
+@pytest.mark.parametrize(
+    ("started_ray", "initialized", "shutdowns"),
+    [(True, True, 1), (True, False, 0), (False, True, 0)],
+)
+def test_close_stops_only_a_ray_runtime_it_started(
+    *,
+    started_ray: bool,
+    initialized: bool,
+    shutdowns: int,
+) -> None:
+    data = _live_data()
+    events: list[str] = []
+    ray = SimpleNamespace(
+        is_initialized=lambda: initialized,
+        shutdown=lambda: events.append("shutdown"),
+    )
+    data._session = cast(
+        CollectionSession,
+        cast(
+            object,
+            SimpleNamespace(started_ray=started_ray, api=SimpleNamespace(ray=ray)),
+        ),
+    )
+    data.close()
+    assert events == ["shutdown"] * shutdowns
+    assert data._session is None
+
+
+def test_close_without_a_session_is_a_no_op() -> None:
+    _live_data().close()
+
+
+def test_load_state_dict_accepts_a_checkpoint_without_a_prompt_cursor() -> None:
+    data = _live_data()
+    data._prompt_loader_state = {"position": 1}
+    data.load_state_dict({"next_step": 3})
+    assert data._next_step == 3
+    assert data._prompt_loader_state is None
+
+
+def test_live_config_rejects_a_non_live_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data = _live_data()
+    monkeypatch.setattr(data, "config", TMaxRolloutData.Config(working_dir="/unused"))
+    with pytest.raises(TypeError, match="non-live config"):
+        _ = data.live_config
 
 
 if __name__ == "__main__":

@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from torch.utils import checkpoint
+
 import pytest
 import torch
-import torch.utils.checkpoint
 
 from priml.baselines.tmax.scoring import (
     _projection_weight,
@@ -164,23 +165,29 @@ def test_chunked_head_backpropagates_into_the_registered_model() -> None:
     assert all(parameter.grad is not None for parameter in model.parameters())
 
 
-def test_each_head_chunk_has_its_own_checkpoint(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Apply activation checkpointing to each output-head chunk."""
-    calls: list[int] = []
+class _ChunkRecorder:
+    """Stand in for ``checkpoint.checkpoint``; record each chunk's width."""
 
-    def checkpoint(
+    def __init__(self) -> None:
+        self.widths: list[int] = []
+
+    def __call__(
+        self,
         function: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
         hidden: torch.Tensor,
         labels: torch.Tensor,
         **_: object,
     ) -> torch.Tensor:
-        """Record one checkpointed chunk and evaluate it."""
-        calls.append(hidden.shape[1])
+        self.widths.append(hidden.shape[1])
         return function(hidden, labels)
 
-    monkeypatch.setattr(torch.utils.checkpoint, "checkpoint", checkpoint)
+
+def test_each_head_chunk_has_its_own_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Apply activation checkpointing to each output-head chunk."""
+    recorder = _ChunkRecorder()
+    monkeypatch.setattr(checkpoint, "checkpoint", recorder)
     head = torch.nn.Linear(4, 8, bias=False)
     score_hidden_labels(
         head,
@@ -190,7 +197,7 @@ def test_each_head_chunk_has_its_own_checkpoint(
         chunk_size=2,
         fp32_head=False,
     )
-    assert calls == [2, 2, 1]
+    assert recorder.widths == [2, 2, 1]
 
 
 def test_chunked_head_rejects_non_positive_chunk_size() -> None:
@@ -205,6 +212,43 @@ def test_chunked_head_rejects_non_positive_chunk_size() -> None:
             temperature=1.0,
             chunk_size=0,
             fp32_head=False,
+        )
+
+
+def test_chunked_head_rejects_non_positive_temperature() -> None:
+    with pytest.raises(ValueError, match="temperature must be positive"):
+        score_hidden_labels(
+            torch.nn.Linear(4, 8, bias=False),
+            torch.randn(1, 3, 4),
+            torch.tensor([[1, 2]]),
+            temperature=0.0,
+            chunk_size=None,
+            fp32_head=False,
+        )
+
+
+def test_the_fp32_head_rejects_a_biased_head() -> None:
+    with pytest.raises(TypeError, match="biased head"):
+        score_hidden_labels(
+            torch.nn.Linear(4, 8, bias=True),
+            torch.randn(1, 3, 4),
+            torch.tensor([[1, 2]]),
+            temperature=1.0,
+            chunk_size=None,
+            fp32_head=True,
+        )
+
+
+def test_scoring_rejects_a_non_positive_head_chunk_size() -> None:
+    model = tiny_qwen35_config().make()
+    with pytest.raises(ValueError, match="head_chunk_size must be positive"):
+        response_logprobs(
+            model,
+            tokens=torch.tensor([1, 2]),
+            segments=torch.ones(2, dtype=torch.long),
+            positions=torch.arange(2),
+            pad_token_id=0,
+            head_chunk_size=0,
         )
 
 
@@ -323,3 +367,9 @@ def test_scoring_rejects_unordered_segments() -> None:
             positions=torch.arange(2),
             pad_token_id=0,
         )
+
+
+if __name__ == "__main__":
+    from priml.lib.testing.runner import test_main
+
+    test_main(__file__)

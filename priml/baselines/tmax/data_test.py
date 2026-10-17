@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Final, cast
 
 import dataclasses
 import functools
@@ -21,6 +21,7 @@ from priml import runtime
 from priml.baselines.tmax import data as data_module
 from priml.baselines.tmax.data import TMaxRolloutData, _read_masks, _row_mapping
 from priml.baselines.tmax.rollouts import (
+    PackedRow,
     RolloutRecord,
     pack_rollouts,
     read_rollout_records,
@@ -29,15 +30,16 @@ from priml.baselines.tmax.train_step import TMaxDPPOTrainStep, tiny_qwen35_confi
 from priml.train.parallelism import FullySharded, NoParallel
 
 
+_CWD: Final = Path(__file__).resolve().parent
+
 if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
 
-    from priml.baselines.tmax.rollouts import PackedRow
     from priml.distributed.testing import WarmPoolGetter
     from priml.train.custom_types import TrainStepProtocol
 
 
-ROOT = Path(__file__).parent
+ROOT = _CWD
 SMOKE_FIXTURE = ROOT / "testdata" / "smoke_rollout.jsonl"
 
 
@@ -67,6 +69,15 @@ def test_data_cadence_reads_a_real_published_rollout() -> None:
     )
 
 
+def _starved_refusal(config: TMaxRolloutData.Config) -> str:
+    """Return ``"refused"`` when too few rows cover the data-parallel world."""
+    try:
+        next(iter(config.make().train_dataloader()))
+    except ValueError as error:
+        return "refused" if "data-parallel world" in str(error) else repr(error)
+    return "no-refusal"
+
+
 def _shard_worker(result_dir: str, smoke_path: str, mesh: DeviceMesh) -> None:
     """Worker: verify this rank's contiguous slice, shared denominator, refusal."""
     result_path = Path(result_dir)
@@ -78,7 +89,7 @@ def _shard_worker(result_dir: str, smoke_path: str, mesh: DeviceMesh) -> None:
         smoke.records_per_update = 2
         smoke.num_samples_per_prompt = 2
         smoke.mask_tool_use = False
-        smoke.pack_length = 10  # one short rollout per row: two rows total
+        smoke.pack_length = 10  # One short rollout per row: two rows total.
         batch = next(iter(smoke.make().train_dataloader()))
         rows = cast(tuple[Mapping[str, object], ...], batch["rows"])
         expected_tail = (3274, 2923, 539, 2923) if rank == 0 else (9764, 728, 3418, 279)
@@ -95,11 +106,7 @@ def _shard_worker(result_dir: str, smoke_path: str, mesh: DeviceMesh) -> None:
         starved.mask_tool_use = False
         starved.filter_zero_std_samples = False
         starved.active_sampling = False
-        try:
-            next(iter(starved.make().train_dataloader()))
-            refusal = "no-refusal"
-        except ValueError as error:
-            refusal = "refused" if "data-parallel world" in str(error) else repr(error)
+        refusal = _starved_refusal(starved)
         ok = sliced_ok and refusal == "refused"
         (result_path / f"rank_{rank}").write_text(
             "ok" if ok else f"FAIL:rows={len(rows)} refusal={refusal}",
@@ -246,12 +253,10 @@ def _write_rollouts(path: Path, records: list[RolloutRecord]) -> None:
     )
 
 
+# Requires a config with ``pack_length=1``, which gives every rollout its own row, so
+# membership reads straight off the row's last token.
 def _batch_records(batch: Mapping[str, object]) -> list[int]:
-    """Return the response token of each one-record row, in row order.
-
-    Requires a config with ``pack_length=1``, which gives every rollout its
-    own row, so membership reads straight off the row's last token.
-    """
+    """Return the response token of each one-record row, in row order."""
     return [
         int(cast(Tensor, row["query_responses"])[-1].item())
         for row in cast(tuple[Mapping[str, object], ...], batch["rows"])
@@ -267,7 +272,7 @@ def test_a_zero_spread_group_is_dropped_and_its_slot_refilled(
         path,
         [
             _composed_record(0, 1.0),
-            _composed_record(1, 1.0),  # zero spread: dropped, slot refilled
+            _composed_record(1, 1.0),  # Zero spread: dropped, slot refilled.
             _composed_record(2, 0.0),
             _composed_record(3, 1.0),
             _composed_record(4, 0.0),
@@ -294,13 +299,13 @@ def test_without_active_sampling_a_dropped_group_wastes_its_slot(
         path,
         [
             _composed_record(0, 1.0),
-            _composed_record(1, 1.0),  # zero spread: the window loses a slot
+            _composed_record(1, 1.0),  # Zero spread: the window loses a slot.
             _composed_record(2, 0.0),
             _composed_record(3, 1.0),
             _composed_record(4, 0.0),
             _composed_record(5, 1.0),
             _composed_record(6, 1.0),
-            _composed_record(7, 1.0),  # zero spread: window two loses a slot
+            _composed_record(7, 1.0),  # Zero spread: window two loses a slot.
         ],
     )
     config = TMaxRolloutData.Config()
@@ -399,7 +404,7 @@ def test_the_eval_slice_is_never_composed(tmp_path: Path) -> None:
         path,
         [
             _composed_record(0, 1.0),
-            _composed_record(1, 1.0),  # zero spread: eval keeps it anyway
+            _composed_record(1, 1.0),  # Zero spread: eval keeps it anyway.
             _composed_record(2, 0.0),
             _composed_record(3, 1.0),
         ],
@@ -436,12 +441,10 @@ def test_eval_records_must_be_whole_groups() -> None:
         next(iter(config.make().eval_dataloader()))
 
 
+# ``pack_length=1`` gives every rollout its own row, so row ``index`` carries response
+# token ``10 + index`` and a slice can be read by value.
 def _packed_rows(count: int) -> list[PackedRow]:
-    """Return ``count`` distinct one-rollout rows, in order.
-
-    ``pack_length=1`` gives every rollout its own row, so row ``index`` carries
-    response token ``10 + index`` and a slice can be read by value.
-    """
+    """Return ``count`` distinct one-rollout rows, in order."""
     return pack_rollouts(
         [
             RolloutRecord(
@@ -565,6 +568,33 @@ def test_shards_make_the_same_number_of_segment_forwards(
         torch.zeros_like(original_loss),
     )
     torch.testing.assert_close(sharded_loss, original_loss, rtol=1e-6, atol=1e-7)
+
+
+def test_construction_rejects_an_empty_working_dir() -> None:
+    config = TMaxRolloutData.Config()
+    with pytest.raises(ValueError, match="working_dir must name a JSONL file"):
+        TMaxRolloutData(config)
+
+
+def test_an_empty_row_cannot_pad_fsdp_scoring() -> None:
+    empty = torch.zeros(0, dtype=torch.long)
+    row = PackedRow(
+        query_responses=empty,
+        attention_mask=empty,
+        position_ids=empty,
+        response_mask=empty,
+        prompt_mask=empty,
+        rollout_sample_ids=empty,
+        vllm_logprobs=empty.float(),
+        advantages=empty.float(),
+        model_steps=empty,
+        dones=empty,
+        num_actions=0,
+        packed_seq_lens=(),
+        original_responses=(),
+    )
+    with pytest.raises(ValueError, match="empty packed row"):
+        data_module._pad_scoring_segments(row, 1)
 
 
 def test_single_token_row_can_pad_an_fsdp_forward(
@@ -940,3 +970,9 @@ def test_artifact_validation_rejects_invalid_group_layout_before_updates(
     with pytest.raises(ValueError, match=message):
         next(iter(data.train_dataloader()))
     assert data._position == 0
+
+
+if __name__ == "__main__":
+    from priml.lib.testing.runner import test_main
+
+    test_main(__file__)

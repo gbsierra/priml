@@ -9,31 +9,49 @@ weights back to vLLM before asking for the next update.
 
 from __future__ import annotations
 
-# pyright: reportAny=false, reportExplicitAny=false, reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false
-from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import asdict, field
-from typing import TYPE_CHECKING, Any, cast, override
+from typing import TYPE_CHECKING, Protocol, override, runtime_checkable
 
-import torch
+from treekle import from_plain
 
 from priml.baselines.tmax.data import TMaxRolloutData
 from priml.baselines.tmax.rollouts import RolloutRecord
+from priml.baselines.tmax.scripts.rollout_writer import RolloutWriter
 from priml.baselines.tmax.scripts.runner import (
     CollectionSession,
-    RolloutWriter,
     RunnerConfig,
-    WeightSync,
     build_session,
     load_upstream_api,
     prime_prompts,
     records_for_update,
     vllm_weight_name_mapper,
 )
+from priml.baselines.tmax.scripts.weight_sync import WeightSync
 from priml.runtime import is_rank_zero
 
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator, Mapping, Sequence
+
+    from torch import Tensor
+
+    import torch
+
     from priml.train.custom_types import TrainStepProtocol
+else:
+    from wrapt import lazy_import
+
+    # ~1050 ms; only the rank-zero broadcasts reach it.
+    torch = lazy_import("torch")
+
+
+@runtime_checkable
+class ExportsHFState(Protocol):
+    """A train step that gathers its policy in Hugging Face names."""
+
+    def hf_state_dict(self) -> dict[str, Tensor]:
+        """Return full policy tensors keyed by Hugging Face name."""
+        ...
 
 
 class LiveTMaxRolloutData(TMaxRolloutData):
@@ -173,7 +191,7 @@ class LiveTMaxRolloutData(TMaxRolloutData):
         ]
         if torch.distributed.is_initialized():
             torch.distributed.broadcast_object_list(replay_frontier, src=0)
-        self._first_missing_step = int(cast(int, replay_frontier[0]))
+        self._first_missing_step = from_plain(replay_frontier[0], int)
         # Upstream triggers the initial weight sync before it starts
         # ``DataPreparationActor`` -- on a fresh run as well as a resumed one
         # (``grpo_fast``'s ``initialize_weight_sync`` fires, then
@@ -187,10 +205,12 @@ class LiveTMaxRolloutData(TMaxRolloutData):
     def _records_for_next_step(self) -> list[RolloutRecord]:
         """Replay a complete staged step or collect and persist a fresh one."""
         if not is_rank_zero():
-            payload: list[object] = [None]
+            received: list[object] = [None]
             if torch.distributed.is_initialized():
-                torch.distributed.broadcast_object_list(payload, src=0)
-            return _records_from_payload(cast(list[Mapping[str, object]], payload[0]))
+                torch.distributed.broadcast_object_list(received, src=0)
+            return _records_from_payload(
+                from_plain(received[0], list[dict[str, object]]),
+            )
 
         if self._writer is None or self._session is None:
             raise RuntimeError("Live TMax runtime is not initialized.")
@@ -222,8 +242,6 @@ class LiveTMaxRolloutData(TMaxRolloutData):
             )
             records = _records_from_payload(raw_records)
             loader_state = self._session.iter_dataloader.state_dict()
-            if not isinstance(loader_state, Mapping):
-                raise TypeError("TMax prompt loader state must be a mapping.")
             self._writer.write_live(
                 self._next_step,
                 raw_records,
@@ -231,17 +249,17 @@ class LiveTMaxRolloutData(TMaxRolloutData):
             )
             self._prompt_loader_state = loader_state
             self._first_missing_step += 1
-        payload = [cast(object, [asdict(record) for record in records])]
+        payload: list[object] = [[asdict(record) for record in records]]
         if torch.distributed.is_initialized():
             torch.distributed.broadcast_object_list(payload, src=0)
         return records
 
     def _sync_latest_policy(self) -> None:
         """Gather the trained policy and let rank zero update vLLM."""
-        if self._step is None:
-            raise RuntimeError("Live TMax data must be bound to a train step.")
+        if not isinstance(self._step, ExportsHFState):
+            raise TypeError("Live TMax data needs a bound step exporting HF weights.")
         # This is collective for FSDP, even though only rank zero owns Ray.
-        state = cast(Any, self._step).hf_state_dict()
+        state = self._step.hf_state_dict()
         if is_rank_zero():
             if self._weight_sync is None:
                 raise RuntimeError("Live TMax weight sync is not initialized.")
@@ -265,12 +283,12 @@ class LiveTMaxRolloutData(TMaxRolloutData):
     def load_state_dict(self, state_dict: Mapping[str, object]) -> None:
         """Restore the cursor after the learner checkpoint is loaded."""
         super().load_state_dict(state_dict)
-        self._next_step = int(cast(int, state_dict.get("next_step", 0)))
+        self._next_step = from_plain(state_dict.get("next_step"), int, default=0)
         prompt_loader = state_dict.get("prompt_loader")
         self._prompt_loader_state = (
-            cast(Mapping[str, object], prompt_loader)
-            if isinstance(prompt_loader, Mapping)
-            else None
+            None
+            if prompt_loader is None
+            else from_plain(prompt_loader, dict[str, object])
         )
 
     def close(self) -> None:
@@ -284,48 +302,17 @@ class LiveTMaxRolloutData(TMaxRolloutData):
         self._writer = None
 
 
+# Extra serialized fields (``dataset``, ``ground_truth``, ``request_info``) belong to
+# TMax and are dropped; every learner field is type-checked.
 def _records_from_payload(
     payload: Sequence[Mapping[str, object]],
 ) -> list[RolloutRecord]:
     """Narrow a broadcast or serialized record payload."""
-    records: list[RolloutRecord] = []
-    for item in payload:
-        fields = {
-            name: item[name]
-            for name in (
-                "step",
-                "sample_idx",
-                "prompt_idx",
-                "prompt_tokens",
-                "response_tokens",
-                "logprobs",
-                "reward",
-                "finish_reason",
-                "tool_mask",
-                "advantage",
-            )
-            if name in item
-        }
-        records.append(
-            RolloutRecord(
-                step=int(cast(int, fields["step"])),
-                sample_idx=int(cast(int, fields["sample_idx"])),
-                prompt_idx=int(cast(int, fields["prompt_idx"])),
-                prompt_tokens=tuple(cast(Sequence[int], fields["prompt_tokens"])),
-                response_tokens=tuple(cast(Sequence[int], fields["response_tokens"])),
-                logprobs=tuple(cast(Sequence[float], fields["logprobs"])),
-                reward=float(cast(float, fields["reward"])),
-                finish_reason=str(fields["finish_reason"]),
-                tool_mask=(
-                    None
-                    if fields.get("tool_mask") is None
-                    else tuple(cast(Sequence[int], fields["tool_mask"]))
-                ),
-                advantage=(
-                    None
-                    if fields.get("advantage") is None
-                    else float(cast(float, fields["advantage"]))
-                ),
-            ),
+    names = RolloutRecord.__dataclass_fields__.keys()
+    return [
+        from_plain(
+            {name: value for name, value in item.items() if name in names},
+            RolloutRecord,
         )
-    return records
+        for item in payload
+    ]

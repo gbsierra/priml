@@ -37,6 +37,17 @@ else:
     save_file = lazy_import("safetensors.torch", "save_file")
 
 
+_WEIGHT_SUFFIXES: Final[frozenset[str]] = frozenset(
+    {".safetensors", ".bin", ".pt", ".pth", ".ckpt", ".gguf", ".msgpack", ".h5"},
+)
+"""Weight-bearing suffixes a tokenizer copy never carries."""
+
+_OWNED_CORE_FILES: Final[frozenset[str]] = frozenset(
+    {"config.json", "model.safetensors"},
+)
+"""Files ``save_hf_checkpoint`` writes itself and never accepts as auxiliary."""
+
+
 def get_cache_dir() -> Path:
     """Return the cache directory for downloads no library env var governs.
 
@@ -333,17 +344,6 @@ def load_hf_checkpoint(
     }
 
 
-_WEIGHT_SUFFIXES: Final[frozenset[str]] = frozenset(
-    {".safetensors", ".bin", ".pt", ".pth", ".ckpt", ".gguf", ".msgpack", ".h5"},
-)
-"""Weight-bearing suffixes a tokenizer copy never carries."""
-
-
-_OWNED_CORE_FILES: Final[frozenset[str]] = frozenset(
-    {"config.json", "model.safetensors"},
-)
-
-
 def save_hf_checkpoint(
     path: Path | str,
     config: Mapping[str, object],
@@ -417,6 +417,7 @@ def _export_metadata(
     auxiliary_files: Iterable[Path | str],
 ) -> dict[str, bytes]:
     """Materialize the immutable files an export will publish."""
+    # Plain json, not treekle: HF readers reject ``py/*`` tags in config.json.
     metadata = {
         "config.json": (json.dumps(dict(config), indent=2) + "\n").encode(),
     }

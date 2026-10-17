@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import cast
+from typing import NoReturn, cast
+from urllib import request
 
 import hashlib
 import json
 import subprocess
 import tarfile
 import tempfile
-import urllib.request
 
 import pyarrow as pa
 import pytest
@@ -23,13 +23,11 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+# The suite runs on the repository's 3.12 floor as well as on 3.14, and only 3.14 can
+# WRITE zstd through tarfile. Compressing a plain tar with pyarrow keeps the fixture
+# available on both.
 def _write_zstd_tar(archive: Path, members: dict[str, str]) -> None:
-    """Write a zstd-compressed tar without tarfile's 3.14-only ``w:zst`` mode.
-
-    The suite runs on the repository's 3.12 floor as well as on 3.14, and only
-    3.14 can WRITE zstd through tarfile. Compressing a plain tar with pyarrow
-    keeps the fixture available on both.
-    """
+    """Write a zstd-compressed tar without tarfile's 3.14-only ``w:zst`` mode."""
     with tempfile.TemporaryDirectory() as scratch:
         plain = Path(scratch) / "plain.tar"
         with tarfile.open(plain, "w:") as tar:
@@ -41,16 +39,23 @@ def _write_zstd_tar(archive: Path, members: dict[str, str]) -> None:
             sink.write(plain.read_bytes())
 
 
-def _no_stage(_directory: Path) -> None:
+def _must_not_call(*args: object, **kwargs: object) -> NoReturn:
+    del args, kwargs
+    pytest.fail("must not be called")
+
+
+def _no_stage(directory: Path) -> None:
     """Stub a network-backed stage in CLI orchestration tests."""
+    del directory
 
 
 def _manifest_path(
-    _checkpoint: Path,
+    checkpoint: Path,
     rollout: Path,
     **_kwargs: object,
 ) -> Path:
     """Stub manifest creation in CLI orchestration tests."""
+    del checkpoint
     return rollout / prepare_data.MANIFEST_NAME
 
 
@@ -167,7 +172,8 @@ def test_the_checkpoint_is_fetched_at_the_pinned_revision(
     """Every repo file is fetched, all at one revision."""
     fetched: list[tuple[str, str]] = []
 
-    def repo_files(_repo: str, *, revision: str) -> list[str]:
+    def repo_files(repo: str, *, revision: str) -> list[str]:
+        del repo
         assert revision == prepare_data.CHECKPOINT_REVISION
         return ["config.json", "model.safetensors"]
 
@@ -214,8 +220,8 @@ def test_the_dataset_is_fetched_at_its_pinned_revision(
     fetched: list[tuple[str, str, Path]] = []
     extracted: list[tuple[Path, Path]] = []
 
-    def repo_files(_repo: str, *, revision: str, repo_type: str) -> list[str]:
-        assert _repo == prepare_data.DATASET_REPO
+    def repo_files(repo: str, *, revision: str, repo_type: str) -> list[str]:
+        assert repo == prepare_data.DATASET_REPO
         assert revision == prepare_data.DATASET_REVISION
         assert repo_type == "dataset"
         return ["data/train-00000-of-00001.parquet", "task-data.tar.gz"]
@@ -305,7 +311,8 @@ def test_an_upstream_checkout_at_the_wrong_commit_is_refused(
 ) -> None:
     """A different checkout must not be silently replaced."""
 
-    def wrong_commit(_directory: Path) -> Path:
+    def wrong_commit(directory: Path) -> Path:
+        del directory
         raise ValueError("wrong TMax commit")
 
     monkeypatch.setattr(upstream, "verify_checkout", wrong_commit)
@@ -329,7 +336,8 @@ def test_the_pinned_archive_is_verified_then_staged(
         {"rollouts/rollouts_part000.jsonl": '{"prompt": "ls"}\n'},
     )
 
-    def archive_path(_directory: Path) -> Path:
+    def archive_path(directory: Path) -> Path:
+        del directory
         return archive
 
     monkeypatch.setattr(prepare_data, "_archive_path", archive_path)
@@ -369,20 +377,22 @@ def test_archive_download_never_publishes_an_interrupted_cache(
         hashlib.sha256(complete).hexdigest(),
     )
 
-    def interrupt(_url: str, destination: Path) -> None:
+    def interrupt(url: str, destination: Path) -> None:
+        del url
         destination.write_bytes(b"incomplete")
         raise OSError("network interrupted")
 
-    monkeypatch.setattr(urllib.request, "urlretrieve", interrupt)
+    monkeypatch.setattr(request, "urlretrieve", interrupt)
     with pytest.raises(OSError, match="network interrupted"):
         prepare_data._download(prepare_data.ARCHIVE_URL, target)
     assert not target.exists()
     assert partial.read_bytes() == b"incomplete"
 
-    def finish(_url: str, destination: Path) -> None:
+    def finish(url: str, destination: Path) -> None:
+        del url
         destination.write_bytes(complete)
 
-    monkeypatch.setattr(urllib.request, "urlretrieve", finish)
+    monkeypatch.setattr(request, "urlretrieve", finish)
     prepare_data._download(prepare_data.ARCHIVE_URL, target)
     assert target.read_bytes() == complete
     assert not partial.exists()
@@ -612,6 +622,205 @@ def test_a_manifest_that_is_not_an_object_is_refused(tmp_path: Path) -> None:
             tmp_path / "rollouts",
             tmp_path / "dataset",
         )
+
+
+def _manifest(tmp_path: Path, payload: object) -> Path:
+    path = tmp_path / prepare_data.MANIFEST_NAME
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def _pinned_manifest(*, files: object) -> dict[str, object]:
+    """Return a manifest whose source pins match, carrying ``files``."""
+    return {
+        "schema": 1,
+        "experiment": "exp000",
+        "upstream_tmax_commit": upstream.UPSTREAM_SHORT,
+        "checkpoint": {
+            "repo": prepare_data.CHECKPOINT_REPO,
+            "revision": prepare_data.CHECKPOINT_REVISION,
+        },
+        "dataset": {
+            "repo": prepare_data.DATASET_REPO,
+            "revision": prepare_data.DATASET_REVISION,
+        },
+        "rollouts": {
+            "archive_url": prepare_data.ARCHIVE_URL,
+            "archive_sha256": prepare_data.ARCHIVE_SHA256,
+            "shard_name": prepare_data.SHARD_NAME,
+        },
+        "files": files,
+    }
+
+
+@pytest.mark.parametrize(
+    ("files", "match"),
+    [
+        (["not", "a", "map"], "records no file map"),
+        ({"a": "short"}, "invalid file digest"),
+    ],
+)
+def test_a_manifest_with_a_malformed_file_map_is_refused(
+    tmp_path: Path,
+    files: object,
+    match: str,
+) -> None:
+    manifest = _manifest(tmp_path, _pinned_manifest(files=files))
+    with pytest.raises(TypeError, match=match):
+        prepare_data._verify_staged_assets(
+            manifest,
+            tmp_path / "checkpoint",
+            tmp_path / "rollouts",
+            tmp_path / "dataset",
+        )
+
+
+def test_a_manifest_that_cannot_be_opened_is_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = _manifest(tmp_path, {})
+
+    def unreadable(path: Path, **kwargs: object) -> str:
+        del path, kwargs
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(Path, "read_text", unreadable)
+    with pytest.raises(ValueError, match="could not be read: denied"):
+        prepare_data._verify_staged_assets(
+            manifest,
+            tmp_path / "checkpoint",
+            tmp_path / "rollouts",
+            tmp_path / "dataset",
+        )
+
+
+def test_a_corrupt_cached_archive_is_replaced(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = tmp_path / "cache.tar.zst"
+    archive.write_bytes(b"corrupt")
+    good = tmp_path / "good.tar.zst"
+    _write_zstd_tar(good, {"rollouts/part.jsonl": '{"prompt": "ls"}\n'})
+    downloads: list[str] = []
+
+    def download(url: str, target: Path) -> None:
+        downloads.append(url)
+        target.write_bytes(good.read_bytes())
+
+    def archive_path(directory: Path) -> Path:
+        del directory
+        return archive
+
+    monkeypatch.setattr(prepare_data, "_archive_path", archive_path)
+    monkeypatch.setattr(prepare_data, "ARCHIVE_SHA256", _sha256(good))
+    monkeypatch.setattr(prepare_data, "_download", download)
+    prepare_data._stage_rollouts(tmp_path / "rollouts")
+    assert downloads == [prepare_data.ARCHIVE_URL]
+    assert (tmp_path / "rollouts" / prepare_data.SHARD_NAME).is_file()
+
+
+def test_a_fully_staged_dataset_is_left_alone(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "train-00000-of-00001.parquet").write_text(
+        "", encoding="utf-8"
+    )
+    (tmp_path / "task-data.tar.gz").write_text("", encoding="utf-8")
+    (tmp_path / prepare_data.TASK_DATA_DIRNAME).mkdir()
+    monkeypatch.setattr(
+        prepare_data,
+        "list_repo_files",
+        _must_not_call,
+    )
+    prepare_data._stage_dataset(tmp_path)
+
+
+def test_task_extraction_is_skipped_when_already_extracted(tmp_path: Path) -> None:
+    target = tmp_path / "extracted"
+    target.mkdir()
+    prepare_data._extract_task_data(tmp_path / "absent.tar.gz", target)
+
+
+def test_task_extraction_requires_the_archive(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError, match="task archive is missing"):
+        prepare_data._extract_task_data(tmp_path / "absent.tar.gz", tmp_path / "out")
+
+
+def test_an_interrupted_task_extraction_is_refused(tmp_path: Path) -> None:
+    archive = tmp_path / "tasks.tar.gz"
+    archive.write_bytes(b"")
+    (tmp_path / "out.partial").mkdir()
+    with pytest.raises(ValueError, match="Incomplete task extraction"):
+        prepare_data._extract_task_data(archive, tmp_path / "out")
+
+
+def test_a_missing_upstream_checkout_is_cloned_at_the_pinned_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    verifications: list[Path] = []
+
+    def verify(directory: Path) -> Path:
+        verifications.append(directory)
+        if len(verifications) == 1:
+            raise FileNotFoundError(directory)
+        return directory
+
+    commands: list[list[str]] = []
+
+    def run(command: list[str], *, check: bool) -> None:
+        assert check
+        commands.append(command)
+
+    monkeypatch.setattr(upstream, "verify_checkout", verify)
+    monkeypatch.setattr(subprocess, "run", run)
+    target = tmp_path / "upstream" / "tmax"
+    prepare_data._stage_upstream(target)
+    assert commands == [
+        ["git", "clone", upstream.UPSTREAM_REPO, str(target)],
+        ["git", "-C", str(target), "checkout", upstream.UPSTREAM_COMMIT],
+    ]
+    assert verifications == [target, target]
+
+
+def test_a_verified_partial_download_is_published_without_refetching(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "archive.tar.zst"
+    partial = target.with_suffix(target.suffix + ".partial")
+    partial.write_bytes(b"payload")
+    monkeypatch.setattr(prepare_data, "ARCHIVE_SHA256", _sha256(partial))
+    monkeypatch.setattr(
+        request,
+        "urlretrieve",
+        _must_not_call,
+    )
+    prepare_data._download("https://example.invalid/a", target)
+    assert target.read_bytes() == b"payload"
+    assert not partial.exists()
+
+
+def test_an_archive_with_a_non_shard_member_still_stages_the_one_shard(
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / "a.tar.zst"
+    _write_zstd_tar(
+        archive,
+        {"README.md": "docs", "rollouts/part.jsonl": '{"prompt": "ls"}\n'},
+    )
+    target = tmp_path / prepare_data.SHARD_NAME
+    prepare_data._extract_shard(archive, target)
+    assert target.read_text(encoding="utf-8") == '{"prompt": "ls"}\n'
+
+
+def test_a_manifest_cannot_record_a_missing_directory(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError, match="Cannot manifest missing checkpoint"):
+        prepare_data._write_manifest(tmp_path / "absent", tmp_path)
 
 
 if __name__ == "__main__":

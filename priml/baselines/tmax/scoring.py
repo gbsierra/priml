@@ -40,35 +40,45 @@ Ported from TMax commit ``6d3d606``,
 
 from __future__ import annotations
 
-# pyright: reportAny=false, reportExplicitAny=false, reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false
+from dataclasses import dataclass
 from itertools import pairwise
 from typing import TYPE_CHECKING, Protocol, cast
 
 from torch import Tensor, nn
+from torch.utils import checkpoint
 
 import torch
-import torch.utils.checkpoint
+
+from priml.math.custom_types import TensorFn
 
 
 if TYPE_CHECKING:
-    from priml.math.custom_types import TensorFn
+    from priml.model.transformer.transformer import OutputProjection
 
 
 class LogitModel(Protocol):
     """A causal language model mapping token ids to logits."""
 
-    def __call__(self, tokens: Tensor, /, **kwargs: object) -> Tensor:
+    def __call__(
+        self,
+        tokens: Tensor,
+        /,
+        *,
+        output_projection: OutputProjection | None = None,
+        **kwargs: object,
+    ) -> Tensor:
         """Return logits for ``tokens``.
 
         Args:
           tokens: Token ids, ``[rows, tokens]``.
+          output_projection: Optional replacement for the head call.
           **kwargs: Forwarded model messages, such as ``positions``.
 
         Returns:
           logits: ``[rows, tokens, vocabulary]``.
 
         """
-        ...
+        raise NotImplementedError
 
 
 def log_softmax_and_gather(logits: Tensor, labels: Tensor) -> Tensor:
@@ -136,24 +146,7 @@ def score_hidden_labels(
         raise ValueError(f"chunk_size must be positive, got {chunk_size}.")
     if getattr(head, "bias", None) is not None and fp32_head:
         raise TypeError("The fp32 head projection does not support a biased head.")
-
-    def score(hidden: Tensor, labels: Tensor) -> Tensor:
-        """Score one chunk, selecting the configured projection arithmetic."""
-        if fp32_head:
-            weight = _projection_weight(head)
-            if weight is None:
-                raise TypeError("The fp32 head has no supported projection weight.")
-            # Keep this cast inside the checkpointed chunk. Hoisting the 4B
-            # head's 2.37 GiB fp32 copy would retain it through the full
-            # backward pass instead of releasing it between recomputations.
-            with torch.autocast(device_type=hidden.device.type, enabled=False):
-                logits = hidden.float() @ weight.float()
-        else:
-            logits = head(hidden).float()
-        if temperature != 1.0:
-            logits = logits / temperature
-        return log_softmax_and_gather(logits, labels)
-
+    score = _ScoreChunk(head=head, temperature=temperature, fp32_head=fp32_head)
     if chunk_size is None:
         return score(hidden[:, :-1], labels)
     pieces: list[Tensor] = []
@@ -161,7 +154,7 @@ def score_hidden_labels(
         high = min(low + chunk_size, hidden.shape[1] - 1)
         # Separate checkpoints let backward release one logits chunk at a time.
         pieces.append(
-            torch.utils.checkpoint.checkpoint(
+            checkpoint.checkpoint(
                 score,
                 hidden[:, low:high],
                 labels[:, low:high],
@@ -169,24 +162,6 @@ def score_hidden_labels(
             ),
         )
     return torch.cat(pieces, dim=1)
-
-
-def _projection_weight(head: object) -> Tensor | None:
-    """Return the ``[hidden, vocab]`` weight a head module projects through.
-
-    A plain head owns its ``[vocab, hidden]`` weight; a tied head
-    (:class:`priml.model.special.TiedLinear`) borrows the embedding's, read
-    through its ``transpose`` flag.
-    """
-    source = getattr(head, "_source", None)
-    if isinstance(source, nn.Module):
-        weight = getattr(source, "weight", None)
-        if isinstance(weight, Tensor):
-            return weight.T if getattr(head, "transpose", False) else weight
-    weight = getattr(head, "weight", None)
-    if isinstance(weight, Tensor):
-        return weight.T
-    return None
 
 
 def response_logprobs(
@@ -260,47 +235,41 @@ def response_logprobs(
                 logits = logits / temperature
             out[:, start : stop - 1] = log_softmax_and_gather(logits, labels)
         else:
-
-            def output_projection(
-                head: TensorFn,
-                hidden: Tensor,
-                labels: Tensor = labels,
-            ) -> Tensor:
-                """Score this segment through the model's registered head."""
-                return score_hidden_labels(
-                    head,
-                    hidden,
-                    labels,
+            out[:, start : stop - 1] = model(
+                tokens[start:stop].unsqueeze(0),
+                positions=positions[start:stop].unsqueeze(0),
+                output_projection=_SegmentScorer(
+                    labels=labels,
                     temperature=temperature,
                     chunk_size=head_chunk_size,
                     fp32_head=fp32_head,
-                )
-
-            scored = model(
-                tokens[start:stop].unsqueeze(0),
-                positions=positions[start:stop].unsqueeze(0),
-                output_projection=output_projection,
+                ),
             )
-            out[:, start : stop - 1] = scored
     return out
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _SegmentScorer:
+    """Score one segment's labels through the model's registered head."""
+
+    labels: Tensor
+    temperature: float
+    chunk_size: int | None
+    fp32_head: bool
+
+    def __call__(self, head: TensorFn, hidden: Tensor, /) -> Tensor:
+        return score_hidden_labels(
+            head,
+            hidden,
+            self.labels,
+            temperature=self.temperature,
+            chunk_size=self.chunk_size,
+            fp32_head=self.fp32_head,
+        )
+
+
 def _segment_bounds(segments: Tensor) -> list[tuple[int, int]]:
-    """Return each segment's half-open token range.
-
-    Args:
-      segments: 1-based segment id per token, ``[tokens]``, non-decreasing
-        because packing appends whole trajectories in order.
-
-    Returns:
-      bounds: ``(start, stop)`` per segment, in order.
-
-    Raises:
-      TypeError: ``segments`` is not one-dimensional.
-      ValueError: ``segments`` is not non-decreasing, which means the row was
-        not produced by :func:`priml.baselines.tmax.rollouts.pack_rollouts`.
-
-    """
+    """Return each segment's half-open token range."""
     if segments.ndim != 1:
         raise TypeError("Packed segment ids must be one-dimensional.")
     values = [int(cast(int, value)) for value in segments.tolist()]
@@ -313,3 +282,44 @@ def _segment_bounds(segments: Tensor) -> list[tuple[int, int]]:
             bounds.append((start, index))
             start = index
     return bounds
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _ScoreChunk:
+    """Score one chunk of hidden states with the configured head arithmetic."""
+
+    head: TensorFn
+    temperature: float
+    fp32_head: bool
+
+    def __call__(self, hidden: Tensor, labels: Tensor) -> Tensor:
+        if self.fp32_head:
+            weight = _projection_weight(self.head)
+            if weight is None:
+                raise TypeError("The fp32 head has no supported projection weight.")
+            # Keep this cast inside the checkpointed chunk. Hoisting the 4B
+            # head's 2.37 GiB fp32 copy would retain it through the full
+            # backward pass instead of releasing it between recomputations.
+            with torch.autocast(device_type=hidden.device.type, enabled=False):
+                logits = hidden.float() @ weight.float()
+        else:
+            logits = self.head(hidden).float()
+        if self.temperature != 1.0:
+            logits = logits / self.temperature
+        return log_softmax_and_gather(logits, labels)
+
+
+# A plain head owns its ``[vocab, hidden]`` weight; a tied head
+# (:class:`priml.model.special.TiedLinear`) borrows the embedding's, read through its
+# ``transpose`` flag.
+def _projection_weight(head: object) -> Tensor | None:
+    """Return the ``[hidden, vocab]`` weight a head module projects through."""
+    source = getattr(head, "_source", None)
+    if isinstance(source, nn.Module):
+        weight = getattr(source, "weight", None)
+        if isinstance(weight, Tensor):
+            return weight.T if getattr(head, "transpose", False) else weight
+    weight = getattr(head, "weight", None)
+    if isinstance(weight, Tensor):
+        return weight.T
+    return None

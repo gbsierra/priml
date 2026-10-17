@@ -5,9 +5,8 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import field
 from pathlib import Path
-from typing import TYPE_CHECKING, Self, cast, override
+from typing import TYPE_CHECKING, Final, Self, cast, override
 
-import json
 import math
 
 from configgle import Makeable, Makes, PartialConfig
@@ -17,6 +16,7 @@ from torch.distributed.checkpoint.state_dict import (  # ty: ignore[unresolved-i
     ValueType,
     set_model_state_dict,
 )
+from treekle import ReadError, from_plain, json_loads
 
 import torch
 
@@ -45,7 +45,7 @@ from priml.runtime import is_rank_zero
 from priml.train.train_step import TrainStep
 
 
-_HF_AUXILIARY_FILE_NAMES = (
+_HF_AUXILIARY_FILE_NAMES: Final = (
     "tokenizer.json",
     "tokenizer_config.json",
     "special_tokens_map.json",
@@ -69,18 +69,15 @@ else:
     DTensor = lazy_import("torch.distributed.tensor", "DTensor")
 
 
+# The released trainer runs ``transformers``' Qwen3.5, and PriML's HF parity tests pin
+# that model's logits and gradients against the native one *only* when the gate and up
+# projections are separate matmuls (``priml.testing.qwen3_5.native_qwen35_config``). The
+# fused projection is PriML's native preference -- same values, one wider matmul -- but
+# it is a different kernel order, which would put the training step's logits outside
+# what the parity tests verify. The parameter layout is unchanged (the split re-reads
+# the fused weight), so checkpoints and goldens load as before.
 def _hf_projection_order(config: Qwen35.Config) -> Qwen35.Config:
-    """Score with the separate gate/up matmuls that Hugging Face Qwen3.5 uses.
-
-    The released trainer runs ``transformers``' Qwen3.5, and PriML's HF parity
-    tests pin that model's logits and gradients against the native one *only*
-    when the gate and up projections are separate matmuls
-    (``priml.testing.qwen3_5.native_qwen35_config``). The fused projection is
-    PriML's native preference -- same values, one wider matmul -- but it is a
-    different kernel order, which would put the training step's logits outside
-    what the parity tests verify. The parameter layout is unchanged (the split
-    re-reads the fused weight), so checkpoints and goldens load as before.
-    """
+    """Score with the separate gate/up matmuls that Hugging Face Qwen3.5 uses."""
     if not isinstance(config.block, list):
         raise TypeError("Qwen3.5 requires an explicit block list.")
     for block in config.block:
@@ -90,154 +87,6 @@ def _hf_projection_order(config: Qwen35.Config) -> Qwen35.Config:
             raise TypeError("Qwen3.5 requires SwiGLU feed-forward blocks.")
         block.ffn.split_gate_projection = True
     return config
-
-
-def _cluster_attention(config: Qwen35.Config) -> Qwen35.Config:
-    """Score the cluster recipe with fused attention, as the released trainer does.
-
-    ``GatedAttention.Config`` defaults to ``SdpaNaive`` because that is the
-    only kernel PriML's Hugging Face parity tests can pin: they build the
-    reference model with ``attn_implementation="eager"``, and only an unfused
-    matmul+softmax produces the same primitive ops (see
-    ``priml.testing.bfb``). The released 4B trainer never runs eager attention --
-    ``model_utils.detect_attn_implementation()`` selects the fastest available
-    backend, flash attention on the H100s the recipe names.
-
-    That is not a stylistic difference at this context length. ``SdpaNaive``
-    materializes ``q @ k^T`` before the softmax, so one full-attention layer over
-    a 67,584-token packed row holds a ``[heads, 67584, 67584]`` score tensor --
-    ~145 GB in bfloat16 for Qwen 3.5-4B's 32 query heads -- before any mask or
-    softmax is applied. The row cannot be scored at all, which is why the
-    released launcher passes ``--sequence_parallel_size 4`` and a fused kernel.
-    ``SdpaFused`` dispatches to the same flash/memory-efficient backends and
-    never materializes the scores.
-
-    Applied only where the staged checkpoint supplies the architecture, so the
-    CPU-sized smoke policy and every HF parity golden keep the eager-equivalent
-    kernel their evidence was generated with.
-
-    Args:
-      config: The checkpoint-derived Qwen3.5 configuration, already in HF
-        projection order.
-
-    Returns:
-      config: The same configuration with full-attention layers fused.
-
-    Raises:
-      TypeError: ``config`` does not carry an explicit block list, or a block
-        is not a transformer block with gated self-attention.
-
-    """
-    if not isinstance(config.block, list):
-        raise TypeError("Qwen3.5 requires an explicit block list.")
-    for block in config.block:
-        if not isinstance(block, TransformerBlock.Config):
-            raise TypeError("Qwen3.5 requires TransformerBlock configs.")
-        if isinstance(block.attn, GatedAttention.Config):
-            block.attn.attn_kernel = SdpaFused.Config()
-    return config
-
-
-def _text_only_config(metadata: Mapping[str, object]) -> dict[str, object]:
-    """Derive the text-only ``config.json`` a text export carries.
-
-    The released source checkpoint is the multimodal form --
-    ``Qwen3_5ForConditionalGeneration`` wrapping a ``text_config`` -- but
-    upstream's own export never carries it: its trainer holds the text model
-    ``AutoModelForCausalLM`` maps that config onto (``Qwen3_5ForCausalLM``,
-    whose ``_keys_to_ignore_on_load_unexpected`` drops the vision tower at
-    load), and that model's ``save_pretrained`` writes the extracted text
-    config. This derives the same config: the nested ``text_config`` fields,
-    the wrapper's tied-head flag propagated the way transformers' text-config
-    extraction and :func:`Qwen35.Config.from_hf` both read it, and the text
-    architecture ``save_pretrained`` would record.
-
-    Args:
-      metadata: The staged checkpoint's ``config.json`` contents.
-
-    Returns:
-      config: The text-only ``config.json`` contents for the export.
-
-    Raises:
-      TypeError: The wrapper carries no ``text_config`` mapping, so no text
-        architecture can be derived from it.
-
-    """
-    nested = metadata.get("text_config")
-    if not isinstance(nested, Mapping):
-        raise TypeError(
-            "Checkpoint export found a conditional-generation config.json "
-            "with no text_config to derive a text-only config from; set "
-            "step.model_path to a text-only source.",
-        )
-    # JSON objects carry string keys, so the staged checkpoint's nested
-    # mapping is the string-keyed config the export writes.
-    result = dict(cast("Mapping[str, object]", nested))
-    if "tie_word_embeddings" in metadata:
-        result["tie_word_embeddings"] = metadata["tie_word_embeddings"]
-    result["architectures"] = ["Qwen3_5ForCausalLM"]
-    return result
-
-
-def _tokenizer_pad_token_id(checkpoint: Path) -> int:
-    """Resolve the staged tokenizer's pad id, as upstream's trainer does.
-
-    Upstream takes ``tokenizer.pad_token_id`` from the tokenizer built off
-    the staged checkpoint, and the released source's ``config.json`` carries
-    no ``pad_token_id`` of its own -- so a config-only reader has nothing to
-    fall back on. The staged ``tokenizer_config.json`` names the pad token
-    and maps every special token to its id, which resolves the same id
-    without building the tokenizer.
-
-    Args:
-      checkpoint: The staged checkpoint directory.
-
-    Returns:
-      pad_token_id: The id the staged tokenizer pads with.
-
-    Raises:
-      ValueError: The staged tokenizer cannot be read, names no pad token, or
-        maps the pad token to no id.
-      TypeError: The staged tokenizer config is not the object this reads.
-
-    """
-    path = checkpoint / "tokenizer_config.json"
-    if not path.is_file():
-        raise ValueError(
-            f"{path} is missing, so the pad id cannot be resolved from the "
-            "staged tokenizer; set step.pad_token_id explicitly.",
-        )
-    try:
-        payload = cast("object", json.loads(path.read_text(encoding="utf-8")))
-    except (OSError, json.JSONDecodeError) as error:
-        raise ValueError(f"{path} could not be read: {error}.") from error
-    if not isinstance(payload, dict):
-        raise TypeError(f"{path} must contain the tokenizer config object.")
-    tokenizer_config = cast("dict[str, object]", payload)
-    token = tokenizer_config.get("pad_token")
-    if isinstance(token, Mapping):
-        token = cast("dict[str, object]", token).get("content")
-    added = tokenizer_config.get("added_tokens_decoder")
-    if isinstance(token, str) and isinstance(added, Mapping):
-        # The decoder maps every special token's id to its record, which is
-        # the same resolution as building the tokenizer.
-        decoder = cast("Mapping[str, Mapping[str, object]]", added)
-        for key, value in decoder.items():
-            if value.get("content") == token:
-                return int(key)
-    raise ValueError(
-        f"{path} names no pad token with a resolvable id; set "
-        "step.pad_token_id explicitly.",
-    )
-
-
-def _hf_auxiliary_files(checkpoint: Path) -> tuple[Path, ...]:
-    """Select the known text-model files carried into an HF export."""
-    return tuple(
-        path
-        for name in _HF_AUXILIARY_FILE_NAMES
-        if (path := checkpoint / name).is_file()
-    )
 
 
 def tiny_qwen35_config(
@@ -258,6 +107,15 @@ def tiny_qwen35_config(
     uses (``proj_out`` borrows the embedding's weight) or the plain head the
     untied parity fixture uses, which is the choice the scoring path tests in
     both forms.
+
+    Args:
+      vocab_size: Vocabulary size.
+      hidden_size: Residual width; scales every other dimension.
+      tie_word_embeddings: Whether the head borrows the embedding weight.
+
+    Returns:
+      config: The smoke-sized Qwen3.5 architecture.
+
     """
     return _hf_projection_order(
         Qwen35.Config.from_hf(
@@ -293,7 +151,12 @@ def tiny_qwen35_config(
 
 
 def qwen35_4b_config() -> Qwen35.Config:
-    """Return the released Qwen3.5-4B text architecture as printable config."""
+    """Return the released Qwen3.5-4B text architecture as printable config.
+
+    Returns:
+      config: The 4B architecture with fused attention.
+
+    """
     return _cluster_attention(
         _hf_projection_order(
             Qwen35.Config.from_hf(
@@ -771,10 +634,12 @@ def _checkpoint_metadata(checkpoint: Path) -> dict[str, object]:
         raise FileNotFoundError(
             f"TMax Qwen checkpoint config not found: {metadata_path}",
         )
-    metadata = cast(object, json.loads(metadata_path.read_text(encoding="utf-8")))
-    if not isinstance(metadata, dict):
-        raise TypeError("Qwen checkpoint config.json must contain an object.")
-    return cast(dict[str, object], metadata)
+    try:
+        return json_loads(metadata_path.read_text(encoding="utf-8"), dict[str, object])
+    except ReadError as error:
+        raise TypeError(
+            "Qwen checkpoint config.json must contain an object.",
+        ) from error
 
 
 def _load_checkpoint_state(model: torch.nn.Module, state: dict[str, Tensor]) -> None:
@@ -842,16 +707,14 @@ def _global_token_count(batch: Mapping[str, object]) -> float | None:
     return count
 
 
+# The dataset packs the whole update before slicing rows across ranks, so its count
+# already spans the data-parallel world; without that count the batch is single-process
+# and its own rows ARE the whole update.
 def _update_token_count(
     batch: Mapping[str, object],
     rows: Sequence[Mapping[str, object]],
 ) -> float:
-    """Return the update's GLOBAL shifted-response-token denominator.
-
-    The dataset packs the whole update before slicing rows across ranks, so
-    its count already spans the data-parallel world; without that count the
-    batch is single-process and its own rows ARE the whole update.
-    """
+    """Return the update's GLOBAL shifted-response-token denominator."""
     global_count = _global_token_count(batch)
     if global_count is not None:
         return global_count
@@ -861,11 +724,9 @@ def _update_token_count(
     return local
 
 
+# Kept on device -- no ``.item()`` -- so the row's hot loop never syncs.
 def _row_mean(values: Tensor, mask: Tensor) -> Tensor:
-    """Mean of ``values`` over ``mask``; an empty mask reports zero.
-
-    Kept on device -- no ``.item()`` -- so the row's hot loop never syncs.
-    """
+    """Mean of ``values`` over ``mask``; an empty mask reports zero."""
     numerator = (values * mask).sum().detach()
     return numerator / mask.sum(dtype=torch.float32).clamp(min=1.0)
 
@@ -878,17 +739,15 @@ def _row_metrics(result: TrainStepOutput) -> dict[str, float | Tensor]:
     return metrics
 
 
+# SUMS, not means: each row's loss is already divided by the update's global token
+# count, so the sum is this rank's share of the DPPO objective. Ratio and divergence
+# combine token-weighted over that same denominator.
 def _merge_results(
     results: list[TrainStepOutput],
     *,
     token_count: float,
 ) -> TrainStepOutput:
-    """Combine per-row diagnostics into the update's single numbers.
-
-    SUMS, not means: each row's loss is already divided by the update's global
-    token count, so the sum is this rank's share of the DPPO objective.
-    Ratio and divergence combine token-weighted over that same denominator.
-    """
+    """Combine per-row diagnostics into the update's single numbers."""
     if not results:
         raise ValueError("Cannot merge an empty DPPO result list.")
     losses = [result["loss"] for result in results]
@@ -916,17 +775,120 @@ def _merge_results(
     }
 
 
+# The training loop all-reduces these as a MEAN over ranks, so the world mean of ``world
+# * (this rank's share of the global token mean)`` is exactly the DPPO loss of the whole
+# update -- the same correction upstream applies before its own backward.
 def _world_scaled(result: TrainStepOutput, world: int) -> TrainStepOutput:
-    """Pre-scale the update's loss and metrics by the DP world size.
-
-    The training loop all-reduces these as a MEAN over ranks, so the world mean
-    of ``world * (this rank's share of the global token mean)`` is exactly the
-    DPPO loss of the whole update -- the same correction upstream applies
-    before its own backward.
-    """
+    """Pre-scale the update's loss and metrics by the DP world size."""
     metrics = _row_metrics(result)
     return {
         "loss": result["loss"] * world,
         "model": result["model"],
         "metrics": {name: value * world for name, value in metrics.items()},
     }
+
+
+# ``GatedAttention.Config`` defaults to ``SdpaNaive`` because that is the only kernel
+# PriML's Hugging Face parity tests can pin: they build the reference model with
+# ``attn_implementation="eager"``, and only an unfused matmul+softmax produces the same
+# primitive ops (see ``priml.testing.bfb``). The released 4B trainer never runs eager
+# attention -- ``model_utils.detect_attn_implementation()`` selects the fastest
+# available backend, flash attention on the H100s the recipe names.
+#
+# That is not a stylistic difference at this context length. ``SdpaNaive`` materializes
+# ``q @ k^T`` before the softmax, so one full-attention layer over a 67,584-token packed
+# row holds a ``[heads, 67584, 67584]`` score tensor -- ~145 GB in bfloat16 for Qwen
+# 3.5-4B's 32 query heads -- before any mask or softmax is applied. The row cannot be
+# scored at all, which is why the released launcher passes ``--sequence_parallel_size
+# 4`` and a fused kernel. ``SdpaFused`` dispatches to the same flash/memory-efficient
+# backends and never materializes the scores.
+#
+# Applied only where the staged checkpoint supplies the architecture, so the CPU-sized
+# smoke policy and every HF parity golden keep the eager-equivalent kernel their
+# evidence was generated with.
+def _cluster_attention(config: Qwen35.Config) -> Qwen35.Config:
+    """Score the cluster recipe with fused attention, as the released trainer does."""
+    if not isinstance(config.block, list):
+        raise TypeError("Qwen3.5 requires an explicit block list.")
+    for block in config.block:
+        if not isinstance(block, TransformerBlock.Config):
+            raise TypeError("Qwen3.5 requires TransformerBlock configs.")
+        if isinstance(block.attn, GatedAttention.Config):
+            block.attn.attn_kernel = SdpaFused.Config()
+    return config
+
+
+# The released source checkpoint is the multimodal form --
+# ``Qwen3_5ForConditionalGeneration`` wrapping a ``text_config`` -- but upstream's own
+# export never carries it: its trainer holds the text model ``AutoModelForCausalLM``
+# maps that config onto (``Qwen3_5ForCausalLM``, whose
+# ``_keys_to_ignore_on_load_unexpected`` drops the vision tower at load), and that
+# model's ``save_pretrained`` writes the extracted text config. This derives the same
+# config: the nested ``text_config`` fields, the wrapper's tied-head flag propagated the
+# way transformers' text-config extraction and :func:`Qwen35.Config.from_hf` both read
+# it, and the text architecture ``save_pretrained`` would record.
+def _text_only_config(metadata: Mapping[str, object]) -> dict[str, object]:
+    """Derive the text-only ``config.json`` a text export carries."""
+    nested = metadata.get("text_config")
+    if not isinstance(nested, Mapping):
+        raise TypeError(
+            "Checkpoint export found a conditional-generation config.json "
+            "with no text_config to derive a text-only config from; set "
+            "step.model_path to a text-only source.",
+        )
+    # JSON objects carry string keys, so the staged checkpoint's nested
+    # mapping is the string-keyed config the export writes.
+    result = dict(cast("Mapping[str, object]", nested))
+    if "tie_word_embeddings" in metadata:
+        result["tie_word_embeddings"] = metadata["tie_word_embeddings"]
+    result["architectures"] = ["Qwen3_5ForCausalLM"]
+    return result
+
+
+# Upstream takes ``tokenizer.pad_token_id`` from the tokenizer built off the staged
+# checkpoint, and the released source's ``config.json`` carries no ``pad_token_id`` of
+# its own -- so a config-only reader has nothing to fall back on. The staged
+# ``tokenizer_config.json`` names the pad token and maps every special token to its id,
+# which resolves the same id without building the tokenizer.
+def _tokenizer_pad_token_id(checkpoint: Path) -> int:
+    """Resolve the staged tokenizer's pad id, as upstream's trainer does."""
+    path = checkpoint / "tokenizer_config.json"
+    if not path.is_file():
+        raise ValueError(
+            f"{path} is missing, so the pad id cannot be resolved from the "
+            "staged tokenizer; set step.pad_token_id explicitly.",
+        )
+    try:
+        tokenizer_config = json_loads(
+            path.read_text(encoding="utf-8"),
+            dict[str, object],
+        )
+    except (OSError, ValueError) as error:
+        raise ValueError(f"{path} could not be read: {error}.") from error
+    token = tokenizer_config.get("pad_token")
+    if not isinstance(token, str):
+        token = from_plain(token, dict[str, object], default={}).get("content")
+    decoder = from_plain(
+        tokenizer_config.get("added_tokens_decoder"),
+        dict[str, dict[str, object]],
+        default={},
+    )
+    if isinstance(token, str):
+        # The decoder maps every special token's id to its record, which is
+        # the same resolution as building the tokenizer.
+        for key, value in decoder.items():
+            if value.get("content") == token:
+                return int(key)
+    raise ValueError(
+        f"{path} names no pad token with a resolvable id; set "
+        "step.pad_token_id explicitly.",
+    )
+
+
+def _hf_auxiliary_files(checkpoint: Path) -> tuple[Path, ...]:
+    """Select the known text-model files carried into an HF export."""
+    return tuple(
+        path
+        for name in _HF_AUXILIARY_FILE_NAMES
+        if (path := checkpoint / name).is_file()
+    )

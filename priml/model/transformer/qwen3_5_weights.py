@@ -54,12 +54,7 @@ def remap_hf_state_dict(
         raise ValueError("Expected exactly one text embedding namespace.")
     prefix = prefixes[0]
     remaining = set(state)
-    with torch.device("meta"):
-        expected_module = config.make()
-    if not isinstance(expected_module, nn.Module):
-        raise TypeError("A deep model config must build an nn.Module.")
-    expected = expected_module.state_dict()
-    finalized = config.copy_tree().finalize()
+    expected, finalized = _native_layout(config)
     assert isinstance(finalized.block, list)
     blocks = finalized.block
     mapped: dict[str, Tensor] = {}
@@ -139,14 +134,9 @@ def export_hf_state_dict(
       TypeError: A custom block cannot be mapped to the HF architecture.
 
     """
-    finalized = config.copy_tree().finalize()
+    expected, finalized = _native_layout(config)
     assert isinstance(finalized.block, list)
     blocks = finalized.block
-    with torch.device("meta"):
-        expected_module = config.make()
-    if not isinstance(expected_module, nn.Module):
-        raise TypeError("A deep model config must build an nn.Module.")
-    expected = expected_module.state_dict()
     remaining = set(state)
     mapped: dict[str, Tensor] = {}
     for target, template in expected.items():
@@ -158,13 +148,7 @@ def export_hf_state_dict(
             shape=tuple(template.shape),
         )
         if len(sources) == 2:
-            # The forward map concatenates gate and up along rows; the split
-            # reads the halves back out. An odd row count would swap the
-            # halves instead of failing, so it is refused here.
-            if value.shape[0] % 2:
-                raise ValueError(
-                    f"{target} needs even rows to split into gate and up.",
-                )
+            # ``_take`` matched the template, whose fused rows are 2x hidden.
             half = value.shape[0] // 2
             mapped[sources[0]] = value[:half]
             mapped[sources[1]] = value[half:]
@@ -173,6 +157,17 @@ def export_hf_state_dict(
     if remaining:
         raise ValueError(f"Unexpected checkpoint weights: {sorted(remaining)}.")
     return mapped
+
+
+def _native_layout(
+    config: DeepModelConfig,
+) -> tuple[dict[str, Tensor], DeepModelConfig]:
+    """Return the meta-device native state dict and the finalized config."""
+    with torch.device("meta"):
+        module = config.make()
+    if not isinstance(module, nn.Module):
+        raise TypeError("A deep model config must build an nn.Module.")
+    return module.state_dict(), config.copy_tree().finalize()
 
 
 def _take(

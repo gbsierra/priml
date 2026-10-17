@@ -41,6 +41,8 @@ from priml.testing.qwen3_5 import hf_config, native_qwen35_config
 from priml.train.parallelism import FullySharded, NoParallel
 
 
+_CWD: Final = Path(__file__).resolve().parent
+
 if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
 
@@ -48,7 +50,7 @@ if TYPE_CHECKING:
     from priml.train.custom_types import TrainStepOutput
 
 
-_TESTDATA: Final = Path(__file__).resolve().parent / "testdata"
+_TESTDATA: Final = _CWD / "testdata"
 
 
 def _batch() -> dict[str, object]:
@@ -479,6 +481,63 @@ def test_export_needs_the_staged_source(tmp_path: Path) -> None:
         step.export_checkpoint(tmp_path / "export")
 
 
+def _staged_step(tmp_path: Path) -> TMaxDPPOTrainStep:
+    config = TMaxDPPOTrainStep.Config()
+    config.model_path = _staged_tiny_checkpoint(tmp_path / "source")
+    config.parallelism = NoParallel.Config(device="cpu")
+    config.dtype_autocast = None
+    return config.make()
+
+
+def test_export_writes_only_on_rank_zero(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every rank gathers the policy; only rank zero writes the directory."""
+    step = _staged_step(tmp_path)
+    monkeypatch.setattr(train_step_module, "is_rank_zero", lambda: False)
+    assert step.export_checkpoint(tmp_path / "export") is None
+    assert not (tmp_path / "export").exists()
+
+
+def test_export_refuses_a_wrapper_without_a_text_config(tmp_path: Path) -> None:
+    step = _staged_step(tmp_path)
+    assert step._checkpoint_metadata is not None
+    step._checkpoint_metadata["text_config"] = "not a mapping"
+    with pytest.raises(TypeError, match="no text_config"):
+        step.export_checkpoint(tmp_path / "export")
+
+
+@pytest.mark.parametrize(
+    ("tokenizer_config", "match"),
+    [
+        ("{not json", "could not be read"),
+        ('{"pad_token": {"content": "<pad>"}}', "no pad token with a resolvable id"),
+    ],
+)
+def test_the_staged_tokenizer_must_resolve_a_pad_id(
+    tmp_path: Path,
+    tokenizer_config: str,
+    match: str,
+) -> None:
+    (tmp_path / "tokenizer_config.json").write_text(tokenizer_config, encoding="utf-8")
+    with pytest.raises(ValueError, match=match):
+        train_step_module._tokenizer_pad_token_id(tmp_path)
+
+
+def test_the_pad_token_may_be_an_added_token_record(tmp_path: Path) -> None:
+    (tmp_path / "tokenizer_config.json").write_text(
+        json.dumps(
+            {
+                "pad_token": {"content": "<pad>"},
+                "added_tokens_decoder": {"7": {"content": "<pad>"}},
+            },
+        ),
+        encoding="utf-8",
+    )
+    assert train_step_module._tokenizer_pad_token_id(tmp_path) == 7
+
+
 def test_export_derives_the_text_only_config(tmp_path: Path) -> None:
     """The released multimodal source exports as the text model upstream saves.
 
@@ -764,3 +823,9 @@ def test_dppo_train_steps_bfb() -> None:
         build_input=_batch,
         seed=42,
     )
+
+
+if __name__ == "__main__":
+    from priml.lib.testing.runner import test_main
+
+    test_main(__file__)

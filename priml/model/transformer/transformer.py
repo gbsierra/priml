@@ -245,9 +245,13 @@ class Transformer(nn.Module):
         Returns:
           result: The Tensor.
 
+        Raises:
+          ValueError: ``output_projection`` is set but there is no head.
+
         """
-        self._validate_output_projection(output_projection)
         if self.proj_out is None:
+            if output_projection is not None:
+                raise ValueError("output_projection requires an output projection.")
             return hidden
         if output_projection is not None:
             return output_projection(self.proj_out, hidden)
@@ -260,27 +264,19 @@ class Transformer(nn.Module):
         /,
         *,
         cache: LayerCache | None = None,
+        output_projection: OutputProjection | None = None,
         **kwargs: object,
     ) -> Tensor:
         """Apply input projection, blocks, and head."""
-        output_projection = kwargs.pop("output_projection", None)
-        self._validate_output_projection(output_projection)
         if self.proj_in is not None:
             x = self.proj_in(x)
         for block in self.blocks:
             x = cast(Tensor, block(x, cache=cache, **kwargs))
         return self.project_to_logits(
             x,
-            output_projection=cast("OutputProjection | None", output_projection),
+            output_projection=output_projection,
             **kwargs,
         )
-
-    def _validate_output_projection(self, output_projection: object | None) -> None:
-        """Reject an invalid output callback before running the stack."""
-        if output_projection is not None and not callable(output_projection):
-            raise TypeError("output_projection must be callable or None.")
-        if output_projection is not None and self.proj_out is None:
-            raise ValueError("output_projection requires an output projection.")
 
 
 def head_is_tied(config: Transformer.Config) -> bool:

@@ -294,11 +294,19 @@ class Qwen35(Transformer):
         return x
 
     @override
-    def forward(self, x: Tensor, /, **kwargs: object) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        /,
+        *,
+        output_projection: OutputProjection | None = None,
+        **kwargs: object,
+    ) -> Tensor:
         """Compute text logits from token IDs or input embeddings.
 
         Args:
           x: Token IDs or input embeddings.
+          output_projection: Optional replacement for the registered head call.
           **kwargs: Block messages and an optional shared layer cache.
 
         Returns:
@@ -306,13 +314,11 @@ class Qwen35(Transformer):
 
         """
         cache = kwargs.pop("cache", None)
-        output_projection = kwargs.pop("output_projection", None)
-        self._validate_output_projection(output_projection)
         if cache is not None and not isinstance(cache, LayerCache):
             raise TypeError("cache must satisfy LayerCache or be None.")
         return self.project_to_logits(
             self.hidden_states(x, cache=cache, **kwargs),
-            output_projection=cast("OutputProjection | None", output_projection),
+            output_projection=output_projection,
             **kwargs,
         )
 

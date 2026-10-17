@@ -105,7 +105,18 @@ def head_commit(root: Path) -> str:
 
 
 def working_tree_status(root: Path) -> str:
-    """Return porcelain status for tracked and untracked checkout changes."""
+    """Return porcelain status for tracked and untracked checkout changes.
+
+    Args:
+      root: A git checkout root.
+
+    Returns:
+      status: ``git status --porcelain`` output; empty for a clean tree.
+
+    Raises:
+      FileNotFoundError: git is unavailable or ``root`` is not a checkout.
+
+    """
     try:
         completed = subprocess.run(  # noqa: S603 -- Fixed Git executable.
             [  # noqa: S607 -- Fixed executable.

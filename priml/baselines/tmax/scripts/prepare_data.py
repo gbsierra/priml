@@ -28,10 +28,10 @@ Examples:
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, Protocol, cast
+from urllib import request
 
 import argparse
 import hashlib
@@ -40,11 +40,9 @@ import logging
 import os
 import subprocess
 import tarfile
-import urllib.request
 
 from huggingface_hub import hf_hub_download, list_repo_files
-
-import pyarrow as pa
+from treekle import ReadError, from_plain, json_loads
 
 from priml.baselines.tmax.experiments import exp000
 from priml.baselines.tmax.scripts import upstream
@@ -53,6 +51,14 @@ from priml.paths import resolve_working_dir
 
 if TYPE_CHECKING:
     from collections.abc import Generator
+
+    import pyarrow as pa
+else:
+    from wrapt import lazy_import
+
+    # ~150 ms; only ``_zstd_tar`` reaches it.
+    pa = lazy_import("pyarrow")
+
 
 logger = logging.getLogger(__name__)
 
@@ -80,21 +86,19 @@ TASK_DATA_DIRNAME: Final = "task-data.tar.gz.extracted"
 """Directory name used by TMax for extracted terminal tasks."""
 
 
-class _Flags(Protocol):
-    """The parsed command line."""
-
-    base_dir: Path
-    checkpoint_dir: Path | None
-    rollouts_dir: Path | None
-    dataset_dir: Path | None
-    upstream_dir: Path | None
-    manifest_path: Path | None
-
-
 def default_directories(
     base_dir: Path | str = "/opt/scratch",
 ) -> tuple[Path, Path]:
-    """Return separate locations for the checkpoint and published rollout."""
+    """Return separate locations for the checkpoint and published rollout.
+
+    Args:
+      base_dir: Root for every default asset directory.
+
+    Returns:
+      checkpoint_dir: Where exp000 reads its staged checkpoint.
+      rollouts_dir: Where the published 9B parity shard is staged.
+
+    """
     config = exp000()
     config.base_dir = base_dir
     config = config.finalize()
@@ -105,11 +109,61 @@ def default_directories(
 
 
 def main() -> int:
-    """Stage the TMax inputs and return the process exit code."""
+    """Stage the TMax inputs and return the process exit code.
+
+    Returns:
+      exit_code: Zero on success.
+
+    """
     parser = argparse.ArgumentParser(
-        description=(__doc__ or "").split("\n", 2)[2],
+        description=__doc__.split("\n", 2)[2] if __doc__ else None,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    _add_arguments(parser)
+    flags = cast(_Flags, parser.parse_args())
+    checkpoint_default, rollouts_default = default_directories(flags.base_dir)
+    flags.checkpoint_dir = flags.checkpoint_dir or checkpoint_default
+    flags.rollouts_dir = flags.rollouts_dir or rollouts_default
+    flags.dataset_dir = flags.dataset_dir or resolve_working_dir(
+        flags.base_dir,
+        "/datasets/tmax/tmax-15k-open-instruct",
+    )
+    flags.upstream_dir = flags.upstream_dir or resolve_working_dir(
+        flags.base_dir,
+        "/datasets/tmax/upstream/tmax",
+    )
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    manifest_target = flags.manifest_path or (flags.rollouts_dir / MANIFEST_NAME)
+    _verify_staged_assets(
+        manifest_target,
+        flags.checkpoint_dir,
+        flags.rollouts_dir,
+        flags.dataset_dir,
+    )
+    _stage_checkpoint(flags.checkpoint_dir)
+    _stage_rollouts(flags.rollouts_dir)
+    _stage_dataset(flags.dataset_dir)
+    _stage_upstream(flags.upstream_dir)
+    manifest = _write_manifest(
+        flags.checkpoint_dir,
+        flags.rollouts_dir,
+        dataset_dir=flags.dataset_dir,
+        upstream_dir=flags.upstream_dir,
+        path=flags.manifest_path,
+    )
+    logger.info(
+        "Staged. exp000 collects its own rollouts through the live TMax seam,"
+        " and the released writer's tool_mask omission is already covered"
+        " there, so no sidecar is needed for it. The staged shard is the"
+        " published 9B parity fixture, which predates that field; training on"
+        " it (rather than on live 4B rollouts) would need"
+        " --override dataset.tool_mask_path=... .",
+    )
+    logger.info("manifest: %s", manifest)
+    return 0
+
+
+def _add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--base-dir",
         type=Path,
@@ -156,72 +210,18 @@ def main() -> int:
             f"({upstream.UPSTREAM_REPO}@{upstream.UPSTREAM_SHORT})."
         ),
     )
-    flags = cast(_Flags, parser.parse_args())
-    checkpoint_default, rollouts_default = default_directories(flags.base_dir)
-    flags.checkpoint_dir = flags.checkpoint_dir or checkpoint_default
-    flags.rollouts_dir = flags.rollouts_dir or rollouts_default
-    flags.dataset_dir = flags.dataset_dir or resolve_working_dir(
-        flags.base_dir,
-        "/datasets/tmax/tmax-15k-open-instruct",
-    )
-    flags.upstream_dir = flags.upstream_dir or resolve_working_dir(
-        flags.base_dir,
-        "/datasets/tmax/upstream/tmax",
-    )
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
-    manifest_target = flags.manifest_path or (flags.rollouts_dir / MANIFEST_NAME)
-    _verify_staged_assets(
-        manifest_target,
-        flags.checkpoint_dir,
-        flags.rollouts_dir,
-        flags.dataset_dir,
-    )
-    _stage_checkpoint(flags.checkpoint_dir)
-    _stage_rollouts(flags.rollouts_dir)
-    _stage_dataset(flags.dataset_dir)
-    _stage_upstream(flags.upstream_dir)
-    manifest = _write_manifest(
-        flags.checkpoint_dir,
-        flags.rollouts_dir,
-        dataset_dir=flags.dataset_dir,
-        upstream_dir=flags.upstream_dir,
-        path=flags.manifest_path,
-    )
-    logger.info(
-        "Staged. exp000 collects its own rollouts through the live TMax seam,"
-        " and the released writer's tool_mask omission is already covered"
-        " there, so no sidecar is needed for it. The staged shard is the"
-        " published 9B parity fixture, which predates that field; training on"
-        " it (rather than on live 4B rollouts) would need"
-        " --override dataset.tool_mask_path=... .",
-    )
-    logger.info("manifest: %s", manifest)
-    return 0
 
 
+# Without a manifest, existing files cannot be tied to the pinned sources, so the script
+# refuses to reuse them. With one, it checks each recorded file's hash and rejects files
+# the manifest does not list.
 def _verify_staged_assets(
     manifest_path: Path,
     checkpoint_dir: Path,
     rollouts_dir: Path,
     dataset_dir: Path,
 ) -> None:
-    """Check that existing assets match the manifest.
-
-    Without a manifest, existing files cannot be tied to the pinned sources,
-    so the script refuses to reuse them. With one, it checks each recorded
-    file's hash and rejects files the manifest does not list.
-
-    Args:
-      manifest_path: The manifest to check, when one exists.
-      checkpoint_dir: The staged checkpoint directory.
-      rollouts_dir: The staged rollout fixture directory.
-      dataset_dir: The staged dataset directory.
-
-    Raises:
-      ValueError: The manifest is unreadable or the assets do not match it.
-      TypeError: The manifest is not an object with a file map.
-
-    """
+    """Check that existing assets match the manifest."""
     if not manifest_path.is_file():
         existing: dict[str, list[str]] = {}
         for label, directory in (
@@ -239,27 +239,23 @@ def _verify_staged_assets(
             )
         return
     try:
-        raw_payload = cast(
-            "object",
-            json.loads(manifest_path.read_text(encoding="utf-8")),
-        )
-    except (OSError, json.JSONDecodeError) as error:
+        text = manifest_path.read_text(encoding="utf-8")
+    except OSError as error:
         raise ValueError(f"{manifest_path} could not be read: {error}.") from error
-    if not isinstance(raw_payload, dict):
-        raise TypeError(f"{manifest_path} must contain an object.")
-    payload = cast("dict[str, object]", raw_payload)
+    try:
+        payload = json_loads(text, dict[str, object])
+    except ReadError as error:
+        raise TypeError(f"{manifest_path} must contain an object.") from error
+    except ValueError as error:
+        raise ValueError(f"{manifest_path} could not be read: {error}.") from error
     _verify_manifest_identity(payload, manifest_path)
-    files = payload.get("files", {})
-    if not isinstance(files, Mapping):
-        raise TypeError(f"{manifest_path} records no file map.")
-    file_items = cast("Mapping[object, object]", files)
+    try:
+        recorded = from_plain(payload.get("files"), dict[str, str], default={})
+    except ReadError as error:
+        raise TypeError(f"{manifest_path} records no file map.") from error
     # The writer records each SHA-256 hash as a 64-character string.
-    if not all(
-        isinstance(name, str) and isinstance(digest, str) and len(digest) == 64
-        for name, digest in file_items.items()
-    ):
+    if any(len(digest) != 64 for digest in recorded.values()):
         raise TypeError(f"{manifest_path} contains an invalid file digest map.")
-    recorded = cast("dict[str, str]", files)
     for label, directory in (
         ("checkpoint", checkpoint_dir),
         ("rollouts", rollouts_dir),
@@ -418,16 +414,7 @@ def _extract_task_data(archive: Path, target: Path) -> None:
 
 
 def _stage_upstream(directory: Path) -> None:
-    """Clone TMax at the pinned commit, or check an existing copy.
-
-    Args:
-      directory: Destination for the pinned TMax checkout.
-
-    Raises:
-      ValueError: The existing copy is at another commit or has local changes.
-      subprocess.CalledProcessError: Cloning or checkout fails.
-
-    """
+    """Clone TMax at the pinned commit, or check an existing copy."""
     try:
         upstream.verify_checkout(directory)
     except FileNotFoundError:
@@ -457,7 +444,7 @@ def _download(url: str, target: Path) -> None:
             partial.replace(target)
             _fsync_directory(target.parent)
             return
-    urllib.request.urlretrieve(  # noqa: S310 -- The URL is a fixed HTTPS dataset endpoint.
+    request.urlretrieve(  # noqa: S310 -- The URL is a fixed HTTPS dataset endpoint.
         url,
         partial,
     )
@@ -482,30 +469,22 @@ def _archive_path(rollouts_dir: Path) -> Path:
     return rollouts_dir.parent / "cache" / "tmax_rollouts_part000.tar.zst"
 
 
+# The published archive is a zstd-compressed tar. PyArrow decompresses it because Python
+# 3.12 cannot read this format directly. A file in another format is rejected rather
+# than treated as a rollout archive.
 def _extract_shard(archive: Path, target: Path) -> None:
-    """Extract one rollout file and move it into place when complete.
-
-    The published archive is a zstd-compressed tar. PyArrow decompresses it
-    because Python 3.12 cannot read this format directly. A file in another
-    format is rejected rather than treated as a rollout archive.
-    """
-    members: list[str] = []
-    payload: bytes | None = None
+    """Extract one rollout file and move it into place when complete."""
     with _zstd_tar(archive) as tar:
-        for member in tar:
-            if not member.isfile() or not member.name.endswith(".jsonl"):
-                continue
-            members.append(member.name)
-            stream = tar.extractfile(member)
-            if stream is None:
-                raise TypeError(f"{member.name} could not be extracted.")
-            content = stream.read()
-            if payload is None:
-                payload = content
-    if len(members) != 1:
-        raise ValueError(f"Expected one JSONL shard, found {len(members)}.")
-    if payload is None:
-        raise TypeError(f"{members[0]} could not be extracted.")
+        payloads = [
+            stream.read()
+            for member in tar
+            if member.isfile()
+            and member.name.endswith(".jsonl")
+            and (stream := tar.extractfile(member)) is not None
+        ]
+    if len(payloads) != 1:
+        raise ValueError(f"Expected one JSONL shard, found {len(payloads)}.")
+    payload = payloads[0]
     # Write to a temporary file so a failed extraction cannot look complete.
     partial = target.with_suffix(".jsonl.partial")
     partial.write_bytes(payload)
@@ -514,19 +493,7 @@ def _extract_shard(archive: Path, target: Path) -> None:
 
 @contextmanager
 def _zstd_tar(archive: Path) -> Generator[tarfile.TarFile]:
-    """Read the zstd-compressed archive as a stream.
-
-    Args:
-      archive: The ``.tar.zst`` file to read.
-
-    Yields:
-      tar: The tar archive. Its files must be read in order because the
-        decompressed stream cannot seek backward.
-
-    Raises:
-      tarfile.ReadError: The file is not a zstd-compressed tar.
-
-    """
+    """Read the zstd-compressed archive as a stream."""
     source = pa.CompressedInputStream(pa.OSFile(str(archive), "rb"), "zstd")
     try:
         try:
@@ -620,5 +587,17 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+class _Flags(Protocol):
+    """The parsed command line."""
+
+    base_dir: Path
+    checkpoint_dir: Path | None
+    rollouts_dir: Path | None
+    dataset_dir: Path | None
+    upstream_dir: Path | None
+    manifest_path: Path | None
+
+
 if __name__ == "__main__":
     raise SystemExit(main())
+# vim: ft=python

@@ -13,11 +13,8 @@ from itertools import pairwise
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, Self, cast, override, runtime_checkable
 
-import json
-
 from configgle import Fig
-
-import torch
+from treekle import ReadError, json_loads
 
 from priml.baselines.tmax.rollouts import (
     AdvantageNormalization,
@@ -35,7 +32,14 @@ from priml.timer import CheckpointableStepTimer
 
 
 if TYPE_CHECKING:
+    import torch
+
     from priml.train.custom_types import TrainStepProtocol
+else:
+    from wrapt import lazy_import
+
+    # ~1050 ms; only ``_pad_scoring_segments`` reaches it.
+    torch = lazy_import("torch")
 
 
 @runtime_checkable
@@ -49,19 +53,6 @@ class ResolvesPadTokenId(Protocol):
     pad_token_id: int
 
 
-class _RolloutBatches:
-    """Re-iterable view of one dataset's recorded rollout updates."""
-
-    def __init__(
-        self,
-        iterator: Callable[[], Iterator[dict[str, object]]],
-    ) -> None:
-        self.iterator = iterator
-
-    def __iter__(self) -> Iterator[dict[str, object]]:
-        return self.iterator()
-
-
 def data_parallel_shape() -> tuple[int, int]:
     """Return ``(rank, world_size)`` for this process in the ``"dp"`` mesh dimension.
 
@@ -69,6 +60,11 @@ def data_parallel_shape() -> tuple[int, int]:
     data-seed dimension, so the row slice and the gradient reduction always
     use the same data-parallel world. A single-process run has no mesh and
     reports ``(0, 1)``.
+
+    Returns:
+      rank: This process's index in ``"dp"``.
+      world_size: The ``"dp"`` dimension's size.
+
     """
     mesh = global_device_mesh()
     if mesh is None or mesh.mesh_dim_names is None or "dp" not in mesh.mesh_dim_names:
@@ -203,7 +199,12 @@ class TMaxRolloutData:
         self._records_cache: list[RolloutRecord] | None = None
 
     def bind_step(self, step: TrainStepProtocol) -> None:
-        """Use the bound step's pad id so packing and scoring remove one id."""
+        """Use the bound step's pad id so packing and scoring remove one id.
+
+        Args:
+          step: The training step whose resolved pad id packing must reuse.
+
+        """
         if isinstance(step, ResolvesPadTokenId):
             step_pad_token_id = int(step.pad_token_id)
             if self.config.pad_token_id not in (None, step_pad_token_id):
@@ -232,6 +233,13 @@ class TMaxRolloutData:
         Live collection uses the same packing step as replaying files. It
         broadcasts records, not tensors, so every rank runs this deterministic
         conversion locally and the update's denominator stays global.
+
+        Args:
+          records: One accepted update, whole prompt groups.
+
+        Returns:
+          batch: This rank's packed rows and the update's global token count.
+
         """
         return self._pack_update(records)
 
@@ -261,36 +269,19 @@ class TMaxRolloutData:
             "response_token_count": _response_token_count(rows),
         }
 
+    # The rollout data is a stream of prompt groups. Upstream's accumulation loop drops
+    # a whole group whose rewards have zero spread; with ``active_sampling`` (the
+    # released launcher's setting) the emptied slot is refilled from the stream, so the
+    # update always holds ``records_per_update`` accepted records. Without it, the
+    # update trains on the survivors of exactly one window of ``records_per_update``
+    # input records. Dropped groups still advance the consumed count, so the saved
+    # position moves past them.
     def _compose_update(
         self,
         records: Sequence[RolloutRecord],
         position: int,
     ) -> tuple[list[RolloutRecord], int]:
-        """Build one update using upstream's group filters.
-
-        The rollout data is a stream of prompt groups. Upstream's
-        accumulation loop drops a whole group whose rewards have zero
-        spread; with ``active_sampling`` (the released launcher's setting)
-        the emptied slot is refilled from the stream, so the update always
-        holds ``records_per_update`` accepted records. Without it, the
-        update trains on the survivors of exactly one window of
-        ``records_per_update`` input records. Dropped groups still advance
-        the consumed count, so the saved position moves past them.
-
-        Args:
-          records: The cached rollout records.
-          position: First unconsumed record index.
-
-        Returns:
-          batch: The update's accepted records, whole prompt groups.
-          consumed: Record index after the update's last consumed group.
-
-        Raises:
-          ValueError: The rollout file ended mid-group or before the
-            update's slots were filled, or every group in the window was
-            dropped.
-
-        """
+        """Build one update using upstream's group filters."""
         config = self.config
         group_size = config.num_samples_per_prompt
         slots = config.records_per_update // group_size
@@ -304,11 +295,6 @@ class TMaxRolloutData:
                     "Rollout file ended before one update's prompt slots "
                     f"were filled; accepted {len(accepted)} of "
                     f"{config.records_per_update} records.",
-                )
-            if len(group) != group_size:
-                raise ValueError(
-                    f"Rollout file ended with {len(group)} records; expected "
-                    f"{group_size} to complete a prompt group.",
                 )
             consumed += group_size
             slots_seen += 1
@@ -341,6 +327,10 @@ class TMaxRolloutData:
         the accumulation loop with both the zero-spread filter and active
         sampling off, so eval numbers stay the same no matter what the
         training filter is set to.
+
+        Yields:
+          batch: The packed eval slice and its token count.
+
         """
         if self.config.eval_records <= 0:
             return
@@ -368,14 +358,12 @@ class TMaxRolloutData:
             "response_token_count": _response_token_count(rows),
         }
 
+    # Contiguous, like upstream's worker split
+    # (``data_loader.prepare_collated_data_for_workers``). Both row counts and scored
+    # segment counts must match: FSDP runs a collective for each segment's forward pass.
+    # Padding adds no loss.
     def _shard_rows(self, rows: list[PackedRow]) -> list[PackedRow]:
-        """Slice this rank's contiguous share of the update's packed rows.
-
-        Contiguous, like upstream's worker split
-        (``data_loader.prepare_collated_data_for_workers``). Both row counts
-        and scored segment counts must match: FSDP runs a collective for
-        each segment's forward pass. Padding adds no loss.
-        """
+        """Slice this rank's contiguous share of the update's packed rows."""
         if self._dp_world <= 1:
             return rows
         if len(rows) < self._dp_world:
@@ -411,14 +399,11 @@ class TMaxRolloutData:
             return self._step_pad_token_id
         return 0  # A synthetic run without a bound step has no tokenizer.
 
+    # Cached at first read on purpose: every rank must pack byte-identical updates, and
+    # a live collector's growing directory would leave the ranks reading different data
+    # mid-run. A shard that appears later is picked up on restart.
     def _records(self) -> list[RolloutRecord]:
-        """Read shards once per process, then apply the optional mask file.
-
-        Cached at first read on purpose: every rank must pack byte-identical
-        updates, and a live collector's growing directory would leave the
-        ranks reading different data mid-run. A shard that appears later is
-        picked up on restart.
-        """
+        """Read shards once per process, then apply the optional mask file."""
         if self._records_cache is not None:
             return self._records_cache
         path = Path(self.config.working_dir)
@@ -551,13 +536,11 @@ def _response_token_count(rows: Sequence[PackedRow]) -> int:
     return sum(int(row.response_mask[1:].bool().sum()) for row in rows)
 
 
+# Upstream's check is ``np.std(reward_scores) == 0``. PriML compares the parsed values
+# directly, so only literally identical rewards are dropped, without importing numpy for
+# one comparison.
 def _zero_spread(group: Sequence[RolloutRecord]) -> bool:
-    """Report whether every reward in a prompt group is the same.
-
-    Upstream's check is ``np.std(reward_scores) == 0``. PriML compares the
-    parsed values directly, so only literally identical rewards are dropped,
-    without importing numpy for one comparison.
-    """
+    """Report whether every reward in a prompt group is the same."""
     first = group[0].reward
     return all(record.reward == first for record in group[1:])
 
@@ -571,10 +554,12 @@ def _read_masks(path: Path | str | None) -> dict[tuple[int, int], tuple[int, ...
         for line_number, line in enumerate(handle, start=1):
             if not line.strip():
                 continue
-            payload = cast(object, json.loads(line))
-            if not isinstance(payload, dict):
-                raise TypeError(f"{path}:{line_number}: expected a JSON object.")
-            payload = cast(dict[str, object], payload)
+            try:
+                payload = json_loads(line, dict[str, object])
+            except ReadError as error:
+                raise TypeError(
+                    f"{path}:{line_number}: expected a JSON object.",
+                ) from error
             try:
                 origin = f"{path}:{line_number}"
                 key = (
@@ -650,3 +635,16 @@ def _validate_artifact(
                 )
         seen.add(key)
         previous_key = key
+
+
+class _RolloutBatches:
+    """Re-iterable view of one dataset's recorded rollout updates."""
+
+    def __init__(
+        self,
+        iterator: Callable[[], Iterator[dict[str, object]]],
+    ) -> None:
+        self.iterator = iterator
+
+    def __iter__(self) -> Iterator[dict[str, object]]:
+        return self.iterator()

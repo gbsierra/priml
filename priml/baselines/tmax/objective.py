@@ -153,7 +153,7 @@ def binary_divergence(
             1.0 - rollout_clip
         ) * ((1.0 - rollout_clip).log() - (1.0 - policy_clip).log())
     else:
-        raise ValueError(  # pyright: ignore[reportUnreachable]
+        raise ValueError(  # pyright: ignore[reportUnreachable] -- Literal-typed config can still carry any string at runtime.
             f"Unknown DPPO divergence type: {divergence_type!r}.",
         )
     return torch.where(response_mask, divergence, torch.zeros_like(divergence))

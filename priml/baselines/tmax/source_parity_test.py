@@ -20,7 +20,9 @@ from priml.testing.bfb import host_agnostic_numerics
 from priml.testing.golden import read_tensors
 
 
-ROOT = Path(__file__).parent
+_CWD: Final = Path(__file__).resolve().parent
+
+ROOT = _CWD
 _PACKED_TENSOR_FIELDS: Final = (
     "query_responses",
     "attention_mask",
@@ -212,3 +214,9 @@ def test_packing_and_advantage_outputs_match_pinned_upstream() -> None:
         rtol=0.0,
         atol=0.0,
     )
+
+
+if __name__ == "__main__":
+    from priml.lib.testing.runner import test_main
+
+    test_main(__file__)

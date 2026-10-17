@@ -25,27 +25,26 @@ upstream implementation.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal, cast
+from typing import TYPE_CHECKING, Final, Literal, cast
 
-import json
 import math
 
 from torch import Tensor
+from treekle import json_loads
 
 import torch
 
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Sequence
+    from collections.abc import Iterable, Mapping, Sequence
     from pathlib import Path
 
 AdvantageNormalization = Literal["standard", "centered", "maxrl"]
 """How a prompt group's rewards become advantages; TMax's 4B recipe centers."""
 
 
-_REQUIRED_FIELDS = (
+_REQUIRED_FIELDS: Final = (
     "step",
     "sample_idx",
     "prompt_idx",
@@ -68,7 +67,7 @@ without ``use_vllm_logprobs``), and a zero-filled fallback would invent a
 confident behavior policy at every sampled token.
 """
 
-_STANDARD_EPS = 1e-8
+_STANDARD_EPS: Final = 1e-8
 """Upstream's floor on a group's reward standard deviation."""
 
 
@@ -147,119 +146,11 @@ def read_rollout_records(path: Path) -> list[RolloutRecord]:
                 continue
             records.append(
                 _record(
-                    cast(Mapping[str, object], json.loads(line)),
+                    json_loads(line, dict[str, object]),
                     origin=f"{path}:{number}",
                 ),
             )
     return records
-
-
-def _record(payload: Mapping[str, object], *, origin: str) -> RolloutRecord:
-    """Validate and narrow one decoded JSON record.
-
-    Args:
-      payload: The decoded object.
-      origin: File and line, for error messages.
-
-    Returns:
-      record: The narrowed record.
-
-    Raises:
-      ValueError: A required field is absent, or the logprobs do not line up
-        with the response.
-
-    """
-    missing = [name for name in _REQUIRED_FIELDS if name not in payload]
-    if missing:
-        raise ValueError(f"{origin}: rollout record is missing {missing}.")
-    response = tuple(
-        parse_json_integer_array(
-            payload["response_tokens"],
-            origin=origin,
-            field="response_tokens",
-        ),
-    )
-    logprobs = tuple(
-        parse_json_float(value, origin=origin, field=f"logprobs[{index}]")
-        for index, value in enumerate(
-            _json_array(payload["logprobs"], origin=origin, field="logprobs"),
-        )
-    )
-    if len(logprobs) != len(response):
-        raise ValueError(
-            f"{origin}: {len(logprobs)} logprobs for {len(response)} response "
-            "tokens; DPPO needs a behavior logprob at every sampled token.",
-        )
-    raw_mask = payload.get("tool_mask")
-    tool_mask = (
-        None
-        if raw_mask is None
-        else tuple(
-            parse_json_integer_array(
-                raw_mask,
-                origin=origin,
-                field="tool_mask",
-            ),
-        )
-    )
-    if tool_mask is not None and len(tool_mask) != len(response):
-        raise ValueError(
-            f"{origin}: {len(tool_mask)} tool-mask values for "
-            f"{len(response)} response tokens.",
-        )
-    advantage = payload.get("advantage")
-    return RolloutRecord(
-        step=parse_json_integer(payload["step"], origin=origin, field="step"),
-        sample_idx=parse_json_integer(
-            payload["sample_idx"],
-            origin=origin,
-            field="sample_idx",
-        ),
-        prompt_idx=parse_json_integer(
-            payload["prompt_idx"],
-            origin=origin,
-            field="prompt_idx",
-        ),
-        prompt_tokens=tuple(
-            parse_json_integer_array(
-                payload["prompt_tokens"],
-                origin=origin,
-                field="prompt_tokens",
-            ),
-        ),
-        response_tokens=response,
-        logprobs=logprobs,
-        reward=parse_json_float(payload["reward"], origin=origin, field="reward"),
-        finish_reason=str(payload["finish_reason"]),
-        tool_mask=tool_mask,
-        advantage=(
-            None
-            if advantage is None
-            else parse_json_float(advantage, origin=origin, field="advantage")
-        ),
-    )
-
-
-def _json_array(value: object, *, origin: str, field: str) -> Iterable[object]:
-    """Narrow a decoded JSON value to an array.
-
-    Args:
-      value: Decoded JSON.
-      origin: Source location included in errors.
-      field: Field name included in errors.
-
-    Returns:
-      items: The value as an iterable.
-
-    Raises:
-      ValueError: The value is not a JSON array.
-
-    """
-    if not isinstance(value, list):
-        raise ValueError(  # noqa: TRY004 -- JSON validation has one public error type.
-            f"{origin}: {field}: expected a JSON array, got {type(value).__name__}.",
-        )
-    return cast(list[object], value)
 
 
 def parse_json_integer_array(
@@ -312,7 +203,20 @@ def parse_json_integer(value: object, *, origin: str, field: str) -> int:
 
 
 def parse_json_float(value: object, *, origin: str, field: str) -> float:
-    """Parse a finite JSON floating-point field."""
+    """Parse a finite JSON floating-point field.
+
+    Args:
+      value: Decoded JSON scalar.
+      origin: Source location included in errors.
+      field: Field name included in errors.
+
+    Returns:
+      number: The finite float value.
+
+    Raises:
+      ValueError: The value is boolean, nonnumeric, or nonfinite.
+
+    """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(  # noqa: TRY004 -- JSON validation has one public error type.
             f"{origin}: {field}: expected a finite number, got {value!r}.",
@@ -381,7 +285,7 @@ def group_advantages(
             torch.zeros_like(grouped),
         )
     else:
-        raise ValueError(  # pyright: ignore[reportUnreachable]
+        raise ValueError(  # pyright: ignore[reportUnreachable] -- Literal-typed config can still carry any string at runtime.
             f"Invalid advantage normalization: {normalization!r}.",
         )
     return advantages.reshape(-1)
@@ -681,3 +585,85 @@ class _RowBuilder:
             packed_seq_lens=tuple(self.sequence_lengths),
             original_responses=tuple(self.original_responses),
         )
+
+
+def _record(payload: Mapping[str, object], *, origin: str) -> RolloutRecord:
+    """Validate and narrow one decoded JSON record."""
+    missing = [name for name in _REQUIRED_FIELDS if name not in payload]
+    if missing:
+        raise ValueError(f"{origin}: rollout record is missing {missing}.")
+    response = tuple(
+        parse_json_integer_array(
+            payload["response_tokens"],
+            origin=origin,
+            field="response_tokens",
+        ),
+    )
+    logprobs = tuple(
+        parse_json_float(value, origin=origin, field=f"logprobs[{index}]")
+        for index, value in enumerate(
+            _json_array(payload["logprobs"], origin=origin, field="logprobs"),
+        )
+    )
+    if len(logprobs) != len(response):
+        raise ValueError(
+            f"{origin}: {len(logprobs)} logprobs for {len(response)} response "
+            "tokens; DPPO needs a behavior logprob at every sampled token.",
+        )
+    raw_mask = payload.get("tool_mask")
+    tool_mask = (
+        None
+        if raw_mask is None
+        else tuple(
+            parse_json_integer_array(
+                raw_mask,
+                origin=origin,
+                field="tool_mask",
+            ),
+        )
+    )
+    if tool_mask is not None and len(tool_mask) != len(response):
+        raise ValueError(
+            f"{origin}: {len(tool_mask)} tool-mask values for "
+            f"{len(response)} response tokens.",
+        )
+    advantage = payload.get("advantage")
+    return RolloutRecord(
+        step=parse_json_integer(payload["step"], origin=origin, field="step"),
+        sample_idx=parse_json_integer(
+            payload["sample_idx"],
+            origin=origin,
+            field="sample_idx",
+        ),
+        prompt_idx=parse_json_integer(
+            payload["prompt_idx"],
+            origin=origin,
+            field="prompt_idx",
+        ),
+        prompt_tokens=tuple(
+            parse_json_integer_array(
+                payload["prompt_tokens"],
+                origin=origin,
+                field="prompt_tokens",
+            ),
+        ),
+        response_tokens=response,
+        logprobs=logprobs,
+        reward=parse_json_float(payload["reward"], origin=origin, field="reward"),
+        finish_reason=str(payload["finish_reason"]),
+        tool_mask=tool_mask,
+        advantage=(
+            None
+            if advantage is None
+            else parse_json_float(advantage, origin=origin, field="advantage")
+        ),
+    )
+
+
+def _json_array(value: object, *, origin: str, field: str) -> Iterable[object]:
+    """Narrow a decoded JSON value to an array."""
+    if not isinstance(value, list):
+        raise ValueError(  # noqa: TRY004 -- JSON validation has one public error type.
+            f"{origin}: {field}: expected a JSON array, got {type(value).__name__}.",
+        )
+    return cast(list[object], value)

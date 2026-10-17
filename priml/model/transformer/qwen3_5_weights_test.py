@@ -177,6 +177,16 @@ def test_rejects_a_config_that_builds_no_module() -> None:
     assert str(error.value) == "A deep model config must build an nn.Module."
 
 
+def test_export_rejects_a_config_that_builds_no_module() -> None:
+    native_config = Qwen35.Config.from_hf(hf_config())
+    state = native_config.make().state_dict()
+    with (
+        patch.object(Qwen35.Config, "make", return_value=object()),
+        pytest.raises(TypeError, match=r"must build an nn\.Module"),
+    ):
+        export_hf_state_dict(state, native_config)
+
+
 def test_rejects_an_injected_block_that_is_not_a_transformer_block() -> None:
     config = hf_config()
     state = Qwen3_5ForCausalLM(Qwen3_5TextConfig(**config)).state_dict()

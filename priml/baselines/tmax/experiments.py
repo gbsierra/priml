@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import field
 from pathlib import Path
-from typing import Self, cast, override
+from typing import Final, Self, override
 
 from configgle import Makes
 
@@ -31,6 +31,9 @@ from priml.train.activation import (
 from priml.train.checkpointer import Checkpointer
 from priml.train.parallelism import FullySharded, NoParallel
 from priml.train.train_loop import TrainLoop
+
+
+_CWD: Final = Path(__file__).resolve().parent
 
 
 class TMaxTrainLoop(
@@ -155,9 +158,8 @@ def exp000() -> TMaxTrainLoop:
     config.max_epochs = 1
     config.step.train_budget_steps = 500
     # Save every 10 updates, retaining the latest 3 and every 50th.
-    if config.checkpointer is None:
-        raise AssertionError("TMax exp000 requires checkpointing.")
-    checkpointer = cast(Checkpointer.Config, config.checkpointer)
+    checkpointer = config.checkpointer
+    assert isinstance(checkpointer, Checkpointer.Config)
     checkpointer.save_every = 10
     checkpointer.keep_last_n = 3
     checkpointer.keep_every = 50
@@ -189,7 +191,7 @@ def exp_smoke() -> TMaxTrainLoop:
     config.step.model = tiny_qwen35_config(vocab_size=248_576)
     config.step.pad_token_id = 0
     offline_data = TMaxRolloutData.Config()
-    fixture = Path(__file__).resolve().parent / "testdata" / "smoke_rollout.jsonl"
+    fixture = _CWD / "testdata" / "smoke_rollout.jsonl"
     offline_data.base_dir = fixture.parent
     offline_data.working_dir = fixture.name
     config.dataset = offline_data

@@ -1,4 +1,9 @@
-"""Rebuild two test fixtures from a published TMax rollout archive.
+#!/bin/sh
+# ruff: noqa: EXE003, D300, D205 -- Polyglot shell/Python script.
+# fmt: off
+'''' 2>/dev/null #
+exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 "$0" "$@"
+Rebuild two test fixtures from a published TMax rollout archive.
 
 Both fixtures come from one shard of the ``allenai/tmax-9b`` run. The shard
 contains four training updates, steps 90 through 93. Each step has 8 prompts
@@ -29,38 +34,105 @@ Run from the repository root:
 
 Python 3.14 or newer is required because its standard ``tarfile`` module can
 read zstd archives. The repository environment uses Python 3.14.
-"""
+'''
+# fmt: on
+
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import cast
+from typing import Final, Protocol, cast
+from urllib import request
 
 import argparse
 import hashlib
 import json
 import tarfile
 import tempfile
-import urllib.request
+
+from treekle import json_loads
 
 
-FIXTURES = Path(__file__).resolve().parents[1] / "testdata"
-RECORDED_LINE = FIXTURES / "recorded_rollout.jsonl"
-RECORDED_ADVANTAGES = FIXTURES / "recorded_advantages.json"
+_CWD: Final = Path(__file__).resolve().parent
 
-ARCHIVE_URL = (
+ARCHIVE_URL: Final = (
     "https://huggingface.co/allenai/tmax-9b/resolve/main/"
     "rollouts/archives/swerl_qwen35_9b_fp32lm_dppo_g32__42__1779685677/"
     "rollouts/rollouts.tar.zst.part-000"
 )
-ARCHIVE_SHA256 = "597f4f36ab78ff13d6917445eb1cd2f5ad4c219ff7b987de2110a59ac86b8632"
-SHARD_RECORDS = 1024
-GROUP_SIZE = 32
-RECORDED_KEY = (91, 216, 6)
-SOURCE_NOTE = (
+ARCHIVE_SHA256: Final = (
+    "597f4f36ab78ff13d6917445eb1cd2f5ad4c219ff7b987de2110a59ac86b8632"
+)
+SHARD_RECORDS: Final = 1024
+GROUP_SIZE: Final = 32
+RECORDED_KEY: Final = (91, 216, 6)
+SOURCE_NOTE: Final = (
     "https://huggingface.co/allenai/tmax-9b "
     "rollouts/archives/swerl_qwen35_9b_fp32lm_dppo_g32__42__1779685677"
 )
+
+
+def main() -> int:
+    """Rebuild both recorded fixtures from the pinned archive and verify.
+
+    Returns:
+      exit_code: Zero when both fixtures match or were rewritten.
+
+    """
+    parser = argparse.ArgumentParser(
+        description="Regenerate the recorded TMax fixtures from the pinned archive.",
+    )
+    _add_arguments(parser)
+    flags = cast("_Flags", parser.parse_args())
+    archive = _archive(flags.archive)
+
+    _verify_sha256(archive)
+    lines = _shard_lines(archive)
+    if len(lines) != SHARD_RECORDS:
+        raise ValueError(f"Expected {SHARD_RECORDS} records, found {len(lines)}.")
+    records = [_record(line) for line in lines]
+
+    ok_line = _check_or_write(
+        flags.fixtures / "recorded_rollout.jsonl",
+        _recorded_line(lines, records) + b"\n",
+        write=flags.write,
+    )
+    ok_advantages = _check_or_write(
+        flags.fixtures / "recorded_advantages.json",
+        _advantages_bytes(records),
+        write=flags.write,
+    )
+    if not (ok_line and ok_advantages):
+        raise SystemExit(1)
+    return 0
+
+
+class _Flags(Protocol):
+    """Parsed command-line flags."""
+
+    archive: Path | None
+    write: bool
+    fixtures: Path
+
+
+def _add_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--archive",
+        type=Path,
+        default=None,
+        help="Reuse a downloaded archive instead of fetching the pinned one.",
+    )
+    parser.add_argument(
+        "--write",
+        action="store_true",
+        help="Rewrite the fixtures; without it the script only verifies.",
+    )
+    parser.add_argument(
+        "--fixtures",
+        type=Path,
+        default=_CWD.parent / "testdata",
+        help="Directory holding the two recorded fixtures.",
+    )
 
 
 def _archive(explicit: Path | None) -> Path:
@@ -69,10 +141,8 @@ def _archive(explicit: Path | None) -> Path:
         return explicit
     cache = Path(tempfile.gettempdir()) / "tmax_rollouts_part000.tar.zst"
     if not cache.exists():
-        print(
-            f"downloading {ARCHIVE_URL}",
-        )
-        urllib.request.urlretrieve(ARCHIVE_URL, cache)
+        print(f"downloading {ARCHIVE_URL}")
+        request.urlretrieve(ARCHIVE_URL, cache)
     return cache
 
 
@@ -92,22 +162,21 @@ def _shard_lines(archive: Path) -> list[bytes]:
     """Read the archive's single rollout JSONL member as raw lines."""
     # Transparent mode: typeshed knows it, and 3.14 detects zstd through it.
     with tarfile.open(archive, "r:*") as tar:
-        members = [
-            member
+        streams = [
+            stream
             for member in tar.getmembers()
-            if member.isfile() and member.name.endswith(".jsonl")
+            if member.isfile()
+            and member.name.endswith(".jsonl")
+            and (stream := tar.extractfile(member)) is not None
         ]
-        if len(members) != 1:
-            raise ValueError(f"Expected one JSONL shard, found {len(members)}.")
-        stream = tar.extractfile(members[0])
-        if stream is None:
-            raise TypeError(f"{members[0].name} could not be extracted.")
-        return stream.read().splitlines()
+        if len(streams) != 1:
+            raise ValueError(f"Expected one JSONL shard, found {len(streams)}.")
+        return streams[0].read().splitlines()
 
 
 def _record(line: bytes) -> dict[str, object]:
     """Parse one raw JSONL record."""
-    return cast(dict[str, object], json.loads(line))
+    return json_loads(line, dict[str, object])
 
 
 def _int(record: dict[str, object], key: str) -> int:
@@ -178,7 +247,7 @@ def _advantages_bytes(records: list[dict[str, object]]) -> bytes:
     return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode() + b"\n"
 
 
-def _check_or_write(path: Path, rebuilt: bytes, write: bool) -> bool:
+def _check_or_write(path: Path, rebuilt: bytes, *, write: bool) -> bool:
     """Compare the rebuilt bytes with the committed fixture, or rewrite it."""
     if path.exists() and path.read_bytes() == rebuilt:
         print(
@@ -186,7 +255,7 @@ def _check_or_write(path: Path, rebuilt: bytes, write: bool) -> bool:
         )
         return True
     if not write:
-        state = "missing" if not path.exists() else "differs from the committed fixture"
+        state = "differs from the committed fixture" if path.exists() else "missing"
         print(
             f"{path.name}: {state}; pass --write to regenerate it",
         )
@@ -198,46 +267,6 @@ def _check_or_write(path: Path, rebuilt: bytes, write: bool) -> bool:
     return True
 
 
-def main() -> None:
-    """Rebuild both recorded fixtures from the pinned archive and verify."""
-    parser = argparse.ArgumentParser(
-        description="Regenerate the recorded TMax fixtures from the pinned archive.",
-    )
-    parser.add_argument(
-        "--archive",
-        type=Path,
-        default=None,
-        help="Reuse a downloaded archive instead of fetching the pinned one.",
-    )
-    parser.add_argument(
-        "--write",
-        action="store_true",
-        help="Rewrite the fixtures; without it the script only verifies.",
-    )
-    args = parser.parse_args()
-    # argparse leaves every attribute as Any; narrow at the boundary.
-    archive = _archive(cast("Path | None", args.archive))
-    write = cast(bool, args.write)
-
-    _verify_sha256(archive)
-    lines = _shard_lines(archive)
-    if len(lines) != SHARD_RECORDS:
-        raise ValueError(f"Expected {SHARD_RECORDS} records, found {len(lines)}.")
-    records = [_record(line) for line in lines]
-
-    ok_line = _check_or_write(
-        RECORDED_LINE,
-        _recorded_line(lines, records) + b"\n",
-        write,
-    )
-    ok_advantages = _check_or_write(
-        RECORDED_ADVANTAGES,
-        _advantages_bytes(records),
-        write,
-    )
-    if not (ok_line and ok_advantages):
-        raise SystemExit(1)
-
-
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
+# vim: ft=python

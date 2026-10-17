@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Final, cast
 
 import json
 
@@ -18,11 +18,13 @@ from priml.baselines.tmax.rollouts import (
 )
 
 
+_CWD: Final = Path(__file__).resolve().parent
+
 if TYPE_CHECKING:
     from priml.baselines.tmax.rollouts import AdvantageNormalization
 
 
-ROOT = Path(__file__).parent
+ROOT = _CWD
 
 
 def _published_payload() -> dict[str, object]:
@@ -341,3 +343,9 @@ def test_packing_refuses_a_padded_prompt() -> None:
             pad_token_id=0,
             mask_tool_use=False,
         )
+
+
+if __name__ == "__main__":
+    from priml.lib.testing.runner import test_main
+
+    test_main(__file__)

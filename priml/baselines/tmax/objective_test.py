@@ -86,3 +86,9 @@ def test_unknown_divergence_is_rejected() -> None:
             response_mask=torch.ones(1, dtype=torch.bool),
             divergence_type=cast(DivergenceType, invalid_divergence()),
         )
+
+
+if __name__ == "__main__":
+    from priml.lib.testing.runner import test_main
+
+    test_main(__file__)

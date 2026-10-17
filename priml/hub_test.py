@@ -615,18 +615,61 @@ def test_save_hf_checkpoint_refuses_all_conflicting_weight_artifacts(
         save_hf_checkpoint(out, {}, {"w": torch.ones(1)})
 
 
+def test_save_hf_checkpoint_refuses_a_file_destination(tmp_path: Path) -> None:
+    """Refuse a destination path that is an existing regular file."""
+    out = tmp_path / "out"
+    out.write_bytes(b"not a directory")
+
+    with pytest.raises(ValueError, match="is not a directory"):
+        save_hf_checkpoint(out, {}, {"w": torch.ones(1)})
+
+    assert out.read_bytes() == b"not a directory"
+
+
+@pytest.mark.parametrize(
+    ("extra", "remove", "match"),
+    [
+        ("notes.txt", None, r"unexpected=\['notes.txt'\]"),
+        (None, "config.json", r"missing=\['config.json'\]"),
+        ("subdir/", None, r"unexpected=\['subdir'\]"),
+    ],
+)
+def test_save_hf_checkpoint_refuses_a_directory_it_does_not_own(
+    tmp_path: Path,
+    extra: str | None,
+    remove: str | None,
+    match: str,
+) -> None:
+    """Refuse to replace weights in a directory with a foreign file set."""
+    out = save_hf_checkpoint(tmp_path / "out", {}, {"w": torch.ones(1)})
+    before = (out / "model.safetensors").read_bytes()
+    if extra is not None and extra.endswith("/"):
+        (out / extra.rstrip("/")).mkdir()
+    elif extra is not None:
+        (out / extra).write_text("x")
+    if remove is not None:
+        (out / remove).unlink()
+
+    with pytest.raises(ValueError, match=match):
+        save_hf_checkpoint(out, {}, {"w": torch.zeros(1)})
+
+    assert (out / "model.safetensors").read_bytes() == before
+
+
+def _fail_save(state: object, filename: str) -> None:
+    """Write a partial file, then fail as a safetensors write error would."""
+    del state
+    Path(filename).write_bytes(b"partial")
+    raise RuntimeError("write failed")
+
+
 def test_save_hf_checkpoint_failure_never_publishes_partial_directory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Leave no destination or staging directory after an initial save fails."""
     out = tmp_path / "out"
-
-    def fail(*_args: object, **_kwargs: object) -> None:
-        """Simulate a safetensors write failure."""
-        raise RuntimeError("write failed")
-
-    monkeypatch.setattr(hub, "save_file", fail)
+    monkeypatch.setattr(hub, "save_file", _fail_save)
     with pytest.raises(RuntimeError, match="write failed"):
         save_hf_checkpoint(out, {}, {"w": torch.ones(1)})
 
@@ -676,13 +719,7 @@ def test_failed_owned_overwrite_preserves_old_export(
         {"w": torch.ones(1)},
     )
     before = (out / "model.safetensors").read_bytes()
-
-    def fail(_state: object, filename: str) -> None:
-        """Write a partial temporary file and then fail."""
-        Path(filename).write_bytes(b"partial")
-        raise RuntimeError("write failed")
-
-    monkeypatch.setattr(hub, "save_file", fail)
+    monkeypatch.setattr(hub, "save_file", _fail_save)
     with pytest.raises(RuntimeError, match="write failed"):
         save_hf_checkpoint(out, {"model_type": "toy"}, {"w": torch.zeros(1)})
 

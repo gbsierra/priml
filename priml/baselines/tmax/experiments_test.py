@@ -169,6 +169,43 @@ def test_exp000_moves_every_path_with_base_dir(tmp_path: Path) -> None:
     )
 
 
+def test_a_path_working_dir_is_used_without_formatting(tmp_path: Path) -> None:
+    config = exp000()
+    config.base_dir = tmp_path
+    config.working_dir = Path("/runs/fixed")
+    finalized = config.finalize()
+    assert isinstance(finalized.dataset, LiveTMaxRolloutData.Config)
+    assert finalized.dataset.base_dir == tmp_path / "runs/fixed"
+
+
+def test_dataset_pad_id_must_match_the_step() -> None:
+    config = exp_smoke()
+    config.dataset.pad_token_id = 7
+    with pytest.raises(ValueError, match=r"dataset\.pad_token_id must match"):
+        config.finalize()
+
+
+def test_live_data_requires_a_model_path() -> None:
+    config = exp000()
+    config.step.model_path = None
+    with pytest.raises(ValueError, match=r"requires step\.model_path"):
+        config.finalize()
+
+
+def test_live_data_requires_an_integer_update_budget() -> None:
+    config = exp000()
+    config.step.train_budget_steps = 0.5
+    with pytest.raises(TypeError, match=r"integer step\.train_budget_steps"):
+        config.finalize()
+
+
+def test_live_data_requires_an_explicit_seed() -> None:
+    config = exp000()
+    config.seed = None
+    with pytest.raises(ValueError, match="explicit seed"):
+        config.finalize()
+
+
 def test_live_data_cannot_escape_the_run_directory(tmp_path: Path) -> None:
     """Live rollouts stay inside the run directory."""
     config = exp000()
@@ -256,3 +293,9 @@ def test_smoke_update_moves_weights() -> None:
     assert update.global_step == 1
     assert torch.isfinite(result["loss"])
     assert not torch.equal(before, next(update.model.parameters()).detach())
+
+
+if __name__ == "__main__":
+    from priml.lib.testing.runner import test_main
+
+    test_main(__file__)
