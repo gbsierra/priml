@@ -1669,7 +1669,7 @@ TMaxTrainLoop.Config(
         │   │   │       depth_index=((31, 32),)
         │   │   │   )
         │   │   ],
-        │   │   proj_out=TiedLinear.Config(
+        │   │   proj_out=ScoringTiedLinear.Config(
         │   │       channels_in=2_560,
         │   │       channels_out=248_320,
         │   │       tied='proj_in',

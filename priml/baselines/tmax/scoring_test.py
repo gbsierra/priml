@@ -10,11 +10,16 @@ import pytest
 import torch
 
 from priml.baselines.tmax.scoring import (
+    LabelScorer,
+    ScoringLinear,
+    ScoringTiedLinear,
     response_logprobs,
     score_hidden_labels,
 )
 from priml.baselines.tmax.train_step import tiny_qwen35_config
 from priml.model.custom_types import has_weight
+from priml.model.transformer.qwen3_5 import Qwen35
+from priml.testing.qwen3_5 import hf_config
 
 
 if TYPE_CHECKING:
@@ -340,6 +345,57 @@ def test_the_fp32_head_rejects_a_model_without_a_head() -> None:
             chunk_size=None,
             fp32_head=True,
         )
+
+
+@pytest.mark.parametrize("tie_word_embeddings", [False, True])
+def test_the_scoring_head_scores_labels_only_when_handed_a_scorer(
+    *,
+    tie_word_embeddings: bool,
+) -> None:
+    """Without a scorer the head is the plain head; with one it returns logprobs."""
+    torch.manual_seed(37)
+    model = tiny_qwen35_config(
+        vocab_size=64,
+        tie_word_embeddings=tie_word_embeddings,
+    ).make()
+    head = model.proj_out
+    assert isinstance(head, (ScoringLinear, ScoringTiedLinear))
+    hidden = torch.randn(2, 5, 16)
+    labels = torch.tensor([[1, 2, 3, 4], [4, 3, 2, 1]])
+    assert has_weight(head)
+    torch.testing.assert_close(head(hidden), hidden @ head.weight.T)
+    scorer = LabelScorer(labels=labels, temperature=1.5, chunk_size=2, fp32_head=True)
+    expected = score_hidden_labels(
+        head,
+        hidden,
+        labels,
+        temperature=1.5,
+        chunk_size=2,
+        fp32_head=True,
+    )
+    torch.testing.assert_close(head(hidden, label_scorer=scorer), expected)
+
+
+def test_scoring_refuses_a_model_whose_head_ignores_the_scorer() -> None:
+    """A plain head would return logits where the scorer expects logprobs."""
+    model = Qwen35.Config.from_hf(hf_config()).make()
+    assert not isinstance(model.proj_out, (ScoringLinear, ScoringTiedLinear))
+    with pytest.raises(TypeError, match="scoring head"):
+        response_logprobs(
+            model,
+            tokens=torch.tensor([1, 2, 3]),
+            segments=torch.ones(3, dtype=torch.long),
+            positions=torch.arange(3),
+            pad_token_id=0,
+            head_chunk_size=2,
+        )
+
+
+def test_the_scoring_head_refuses_a_foreign_scorer() -> None:
+    head = tiny_qwen35_config().make().proj_out
+    assert head is not None
+    with pytest.raises(TypeError, match="LabelScorer"):
+        head(torch.randn(2, 3, 16), label_scorer="not a scorer")
 
 
 def test_scoring_rejects_two_dimensional_segments() -> None:

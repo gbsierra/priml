@@ -34,7 +34,7 @@ from priml.model.special import TiedLinear
 from priml.model.swiglu import SwiGLU
 from priml.model.transformer.block import TransformerBlock
 from priml.model.transformer.qwen3_5_weights import remap_hf_state_dict
-from priml.model.transformer.transformer import OutputProjection, Transformer
+from priml.model.transformer.transformer import Transformer
 
 
 if TYPE_CHECKING:
@@ -205,13 +205,7 @@ class Qwen35(Transformer):
         self.norm.reset_parameters()
 
     @override
-    def project_to_logits(
-        self,
-        hidden: Tensor,
-        *,
-        output_projection: OutputProjection | None = None,
-        **kwargs: object,
-    ) -> Tensor:
+    def project_to_logits(self, hidden: Tensor, **kwargs: object) -> Tensor:
         """Normalize the residual stream, then apply the language-model head.
 
         The final norm lives HERE rather than in :meth:`hidden_states`, so the
@@ -220,19 +214,13 @@ class Qwen35(Transformer):
 
         Args:
           hidden: Pre-norm residual stream [..., sequence, channels_in].
-          output_projection: Optional replacement for the registered head call;
-            it receives the normalized hidden states.
           **kwargs: Messages forwarded to the output head.
 
         Returns:
           output: Logits, or normalized hidden states without an output head.
 
         """
-        return super().project_to_logits(
-            self.norm(hidden),
-            output_projection=output_projection,
-            **kwargs,
-        )
+        return super().project_to_logits(self.norm(hidden), **kwargs)
 
     def hidden_states(
         self,
@@ -294,19 +282,11 @@ class Qwen35(Transformer):
         return x
 
     @override
-    def forward(
-        self,
-        x: Tensor,
-        /,
-        *,
-        output_projection: OutputProjection | None = None,
-        **kwargs: object,
-    ) -> Tensor:
+    def forward(self, x: Tensor, /, **kwargs: object) -> Tensor:
         """Compute text logits from token IDs or input embeddings.
 
         Args:
           x: Token IDs or input embeddings.
-          output_projection: Optional replacement for the registered head call.
           **kwargs: Block messages and an optional shared layer cache.
 
         Returns:
@@ -318,7 +298,6 @@ class Qwen35(Transformer):
             raise TypeError("cache must satisfy LayerCache or be None.")
         return self.project_to_logits(
             self.hidden_states(x, cache=cache, **kwargs),
-            output_projection=output_projection,
             **kwargs,
         )
 

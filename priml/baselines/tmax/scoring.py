@@ -42,8 +42,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from itertools import pairwise
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import Protocol, cast, override
 
+from configgle import Makes
 from torch import Tensor, nn
 from torch.utils import checkpoint
 
@@ -51,35 +52,85 @@ import torch
 
 from priml.math.custom_types import TensorFn
 from priml.model.custom_types import has_weight
-
-
-if TYPE_CHECKING:
-    from priml.model.transformer.transformer import OutputProjection
+from priml.model.linear import Linear
+from priml.model.special import TiedLinear
 
 
 class LogitModel(Protocol):
     """A causal language model mapping token ids to logits."""
 
-    def __call__(
-        self,
-        tokens: Tensor,
-        /,
-        *,
-        output_projection: OutputProjection | None = None,
-        **kwargs: object,
-    ) -> Tensor:
+    def __call__(self, tokens: Tensor, /, **kwargs: object) -> Tensor:
         """Return logits for ``tokens``.
 
         Args:
           tokens: Token ids, ``[rows, tokens]``.
-          output_projection: Optional replacement for the head call.
-          **kwargs: Forwarded model messages, such as ``positions``.
+          **kwargs: Forwarded model messages, such as ``positions`` or a
+            ``label_scorer`` for a scoring head.
 
         Returns:
-          logits: ``[rows, tokens, vocabulary]``.
+          logits: ``[rows, tokens, vocabulary]``, or label logprobs
+            ``[rows, tokens - 1]`` when a scoring head receives a scorer.
 
         """
         raise NotImplementedError
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class LabelScorer:
+    """Score one segment's labels through the head that receives it."""
+
+    labels: Tensor
+    temperature: float
+    chunk_size: int | None
+    fp32_head: bool
+
+    def __call__(self, head: TensorFn, hidden: Tensor, /) -> Tensor:
+        """Return label logprobs for head-ready hidden states."""
+        return score_hidden_labels(
+            head,
+            hidden,
+            self.labels,
+            temperature=self.temperature,
+            chunk_size=self.chunk_size,
+            fp32_head=self.fp32_head,
+        )
+
+
+class ScoringLinear(Linear):
+    """A ``Linear`` head that scores labels when the forward carries a scorer.
+
+    The scorer runs INSIDE the model's forward. Under the recipe's root-level
+    FSDP, the head's full weight exists only there; scoring hidden states
+    after the forward would read one rank's shard.
+    """
+
+    class Config(Makes["ScoringLinear"], Linear.Config, kw_only=False):
+        """``Linear`` settings; the scorer is a per-call message."""
+
+    @override
+    def forward(self, input: Tensor, **kwargs: object) -> Tensor:
+        return _project_or_score(
+            self,
+            input,
+            project=super().forward,
+            scorer=kwargs.get("label_scorer"),
+        )
+
+
+class ScoringTiedLinear(TiedLinear):
+    """The tied form of :class:`ScoringLinear`, for the released 4B head."""
+
+    class Config(Makes["ScoringTiedLinear"], TiedLinear.Config, kw_only=False):
+        """``TiedLinear`` settings; the scorer is a per-call message."""
+
+    @override
+    def forward(self, x: Tensor, **kwargs: object) -> Tensor:
+        return _project_or_score(
+            self,
+            x,
+            project=super().forward,
+            scorer=kwargs.get("label_scorer"),
+        )
 
 
 def log_softmax_and_gather(logits: Tensor, labels: Tensor) -> Tensor:
@@ -200,8 +251,8 @@ def response_logprobs(
       ValueError: ``temperature`` is not positive, ``head_chunk_size`` is not
         positive, or the row has fewer than two tokens, which cannot be
         teacher forced.
-      TypeError: ``segments`` is not one-dimensional, or the model does not
-        support the injected hidden projection.
+      TypeError: ``segments`` is not one-dimensional, or chunked or fp32
+        scoring reaches a model without a scoring head.
 
     """
     if temperature <= 0.0:
@@ -236,37 +287,39 @@ def response_logprobs(
                 logits = logits / temperature
             out[:, start : stop - 1] = log_softmax_and_gather(logits, labels)
         else:
-            out[:, start : stop - 1] = model(
+            scores = model(
                 tokens[start:stop].unsqueeze(0),
                 positions=positions[start:stop].unsqueeze(0),
-                output_projection=_SegmentScorer(
+                label_scorer=LabelScorer(
                     labels=labels,
                     temperature=temperature,
                     chunk_size=head_chunk_size,
                     fp32_head=fp32_head,
                 ),
             )
+            # A plain head ignores the message and returns full logits.
+            if scores.shape != labels.shape:
+                raise TypeError(
+                    "Chunked or fp32 scoring needs a scoring head; got output "
+                    f"{tuple(scores.shape)} for labels {tuple(labels.shape)}.",
+                )
+            out[:, start : stop - 1] = scores
     return out
 
 
-@dataclass(frozen=True, slots=True, kw_only=True)
-class _SegmentScorer:
-    """Score one segment's labels through the model's registered head."""
-
-    labels: Tensor
-    temperature: float
-    chunk_size: int | None
-    fp32_head: bool
-
-    def __call__(self, head: TensorFn, hidden: Tensor, /) -> Tensor:
-        return score_hidden_labels(
-            head,
-            hidden,
-            self.labels,
-            temperature=self.temperature,
-            chunk_size=self.chunk_size,
-            fp32_head=self.fp32_head,
-        )
+def _project_or_score(
+    head: TensorFn,
+    hidden: Tensor,
+    *,
+    project: TensorFn,
+    scorer: object,
+) -> Tensor:
+    """Project ``hidden`` plainly, or score labels when handed a scorer."""
+    if scorer is None:
+        return project(hidden)
+    if not isinstance(scorer, LabelScorer):
+        raise TypeError(f"label_scorer must be a LabelScorer, got {scorer!r}.")
+    return scorer(head, hidden)
 
 
 def _segment_bounds(segments: Tensor) -> list[tuple[int, int]]:

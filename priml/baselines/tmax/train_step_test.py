@@ -27,6 +27,7 @@ from priml.baselines.tmax.train_step import (
     _row_metrics,
     _row_response_tokens,
     _rows,
+    _scoring_head,
     _update_token_count,
     tiny_qwen35_config,
 )
@@ -256,6 +257,12 @@ def test_the_hf_projection_order_refuses_a_tree_it_cannot_reach() -> None:
     template.block = [block]
     with pytest.raises(TypeError, match="SwiGLU feed-forward blocks"):
         _hf_projection_order(template)
+
+
+def test_the_scoring_head_refuses_a_head_it_cannot_score_through() -> None:
+    """Only a linear head has the weight chunked fp32 scoring projects with."""
+    with pytest.raises(TypeError, match="linear head"):
+        _scoring_head(Qwen35.Config())
 
 
 def test_temperature_must_be_positive() -> None:

@@ -13,7 +13,7 @@ per-layer list. Each layer receives its own depth index.
 from __future__ import annotations
 
 from dataclasses import KW_ONLY, field
-from typing import TYPE_CHECKING, Protocol, Self, cast, override
+from typing import Self, cast, override
 
 from configgle import Fig, Makeable
 from torch import Tensor, nn
@@ -38,22 +38,6 @@ from priml.model.legacy_keys import absorb_legacy_keys
 from priml.model.sequential import Sequential
 from priml.model.special import TiedLinear
 from priml.model.transformer.block import TransformerBlock
-
-
-if TYPE_CHECKING:
-    from priml.math.custom_types import TensorFn
-
-
-class OutputProjection(Protocol):
-    """Let a caller control how hidden states pass through the output head.
-
-    This can score the vocabulary in small chunks instead of keeping the full
-    logits tensor in memory.
-    """
-
-    def __call__(self, head: TensorFn, hidden: Tensor, /) -> Tensor:
-        """Project head-ready hidden states to logits or derived scores."""
-        ...
 
 
 class Transformer(nn.Module):
@@ -228,36 +212,18 @@ class Transformer(nn.Module):
             if isinstance(module, HasResetParameters):
                 module.reset_parameters()
 
-    def project_to_logits(
-        self,
-        hidden: Tensor,
-        *,
-        output_projection: OutputProjection | None = None,
-        **kwargs: object,
-    ) -> Tensor:
+    def project_to_logits(self, hidden: Tensor, **kwargs: object) -> Tensor:
         """Apply the head, or return hidden states when absent.
 
         Args:
-          hidden: Head-ready hidden states, ``[..., sequence, channels]``.
-          output_projection: Called as ``output_projection(head, hidden)`` in
-            place of the head; ``**kwargs`` are then not forwarded.
-          **kwargs: Messages forwarded to the head.
+          hidden: Hidden.
+          **kwargs: Kwargs.
 
         Returns:
-          result: The head's output, the projection's output, or ``hidden``
-            unchanged when there is no head.
-
-        Raises:
-          ValueError: ``output_projection`` is set but there is no head.
+          result: The Tensor.
 
         """
-        if self.proj_out is None:
-            if output_projection is not None:
-                raise ValueError("output_projection requires an output projection.")
-            return hidden
-        if output_projection is not None:
-            return output_projection(self.proj_out, hidden)
-        return self.proj_out(hidden, **kwargs)
+        return hidden if self.proj_out is None else self.proj_out(hidden, **kwargs)
 
     @override
     def forward(
@@ -266,7 +232,6 @@ class Transformer(nn.Module):
         /,
         *,
         cache: LayerCache | None = None,
-        output_projection: OutputProjection | None = None,
         **kwargs: object,
     ) -> Tensor:
         """Apply input projection, blocks, and head."""
@@ -274,11 +239,7 @@ class Transformer(nn.Module):
             x = self.proj_in(x)
         for block in self.blocks:
             x = cast(Tensor, block(x, cache=cache, **kwargs))
-        return self.project_to_logits(
-            x,
-            output_projection=output_projection,
-            **kwargs,
-        )
+        return self.project_to_logits(x, **kwargs)
 
 
 def head_is_tied(config: Transformer.Config) -> bool:

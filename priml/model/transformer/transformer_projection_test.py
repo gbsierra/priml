@@ -1,9 +1,5 @@
 """Optional input/output projections and attention-owned causality."""
 
-from __future__ import annotations
-
-from typing import TYPE_CHECKING, cast
-
 import pytest
 import torch
 
@@ -16,10 +12,6 @@ from priml.model.special import TiedLinear
 from priml.model.transformer.block import TransformerBlock
 from priml.model.transformer.transformer import Transformer
 from priml.testing.bfb import randomize_parameters
-
-
-if TYPE_CHECKING:
-    from priml.math.custom_types import TensorFn
 
 
 def _config() -> Transformer.Config:
@@ -72,47 +64,6 @@ def test_output_width_is_inferred_from_projection() -> None:
     assert resolved.channels_out == 3
     assert config.channels_out == -1
     assert config.make()(torch.randn(2, 3, 8)).shape == (2, 3, 3)
-
-
-class _NarrowProjection:
-    """Record each head call and keep the first two output columns."""
-
-    def __init__(self) -> None:
-        self.calls: list[tuple[TensorFn, torch.Tensor]] = []
-
-    def __call__(self, head: TensorFn, hidden: torch.Tensor, /) -> torch.Tensor:
-        """Record the head input and return a narrow projection."""
-        self.calls.append((head, hidden))
-        return head(hidden)[..., :2]
-
-
-def test_output_projection_can_replace_the_registered_head_call() -> None:
-    """Allow one forward pass to replace the registered output-head call."""
-    config = _config()
-    config.proj_out = Linear.Config(channels_out=3)
-    model = config.make()
-    inputs = torch.randn(2, 3, 8)
-    hidden = cast(torch.Tensor, model.blocks[0](inputs))
-    assert isinstance(model.proj_out, Linear)
-    projection = _NarrowProjection()
-
-    actual = model(inputs, output_projection=projection)
-
-    assert len(projection.calls) == 1
-    assert projection.calls[0][0] is model.proj_out
-    assert torch.equal(projection.calls[0][1], hidden)
-    assert torch.equal(actual, model.proj_out(hidden)[..., :2])
-
-
-def test_output_projection_requires_a_registered_head() -> None:
-    """Reject an output callback when the transformer has no output head."""
-    model = _config().make()
-    projection = _NarrowProjection()
-
-    with pytest.raises(ValueError, match="requires an output projection"):
-        model(torch.randn(2, 3, 8), output_projection=projection)
-
-    assert not projection.calls
 
 
 def test_generation_requires_token_input_projection() -> None:

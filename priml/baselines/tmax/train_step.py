@@ -32,10 +32,14 @@ from priml.baselines.tmax.objective import (
 )
 from priml.baselines.tmax.scoring import (
     LogitModel,
+    ScoringLinear,
+    ScoringTiedLinear,
     response_logprobs,
 )
 from priml.model.attention.gated_attention import GatedAttention
 from priml.model.attention.kernel import SdpaFused
+from priml.model.linear import Linear
+from priml.model.special import TiedLinear
 from priml.model.swiglu import SwiGLU
 from priml.model.transformer.block import TransformerBlock
 from priml.model.transformer.qwen3_5 import Qwen35
@@ -89,6 +93,18 @@ def _hf_projection_order(config: Qwen35.Config) -> Qwen35.Config:
     return config
 
 
+def _scoring_head(config: Qwen35.Config) -> Qwen35.Config:
+    """Swap the language-model head for its label-scoring form."""
+    head = config.proj_out
+    if isinstance(head, TiedLinear.Config):
+        config.proj_out = ScoringTiedLinear.Config().update(head)
+    elif isinstance(head, Linear.Config):
+        config.proj_out = ScoringLinear.Config().update(head)
+    else:
+        raise TypeError(f"TMax scoring needs a linear head, got {head!r}.")
+    return config
+
+
 def tiny_qwen35_config(
     *,
     vocab_size: int = 32,
@@ -117,35 +133,37 @@ def tiny_qwen35_config(
       config: The smoke-sized Qwen3.5 architecture.
 
     """
-    return _hf_projection_order(
-        Qwen35.Config.from_hf(
-            {
-                "model_type": "qwen3_5_text",
-                "vocab_size": vocab_size,
-                "hidden_size": hidden_size,
-                "intermediate_size": hidden_size * 3 // 2,
-                "num_hidden_layers": 2,
-                "num_attention_heads": 2,
-                "num_key_value_heads": 1,
-                "head_dim": hidden_size // 2,
-                "linear_num_key_heads": 1,
-                "linear_num_value_heads": 2,
-                "linear_key_head_dim": hidden_size // 4,
-                "linear_value_head_dim": hidden_size // 4,
-                "linear_conv_kernel_dim": 4,
-                "layer_types": ["linear_attention", "full_attention"],
-                "rope_parameters": {
-                    "rope_type": "default",
-                    "rope_theta": 10_000.0,
-                    "partial_rotary_factor": 0.5,
-                    "mrope_section": [1, 1, 0],
+    return _scoring_head(
+        _hf_projection_order(
+            Qwen35.Config.from_hf(
+                {
+                    "model_type": "qwen3_5_text",
+                    "vocab_size": vocab_size,
+                    "hidden_size": hidden_size,
+                    "intermediate_size": hidden_size * 3 // 2,
+                    "num_hidden_layers": 2,
+                    "num_attention_heads": 2,
+                    "num_key_value_heads": 1,
+                    "head_dim": hidden_size // 2,
+                    "linear_num_key_heads": 1,
+                    "linear_num_value_heads": 2,
+                    "linear_key_head_dim": hidden_size // 4,
+                    "linear_value_head_dim": hidden_size // 4,
+                    "linear_conv_kernel_dim": 4,
+                    "layer_types": ["linear_attention", "full_attention"],
+                    "rope_parameters": {
+                        "rope_type": "default",
+                        "rope_theta": 10_000.0,
+                        "partial_rotary_factor": 0.5,
+                        "mrope_section": [1, 1, 0],
+                    },
+                    "hidden_act": "silu",
+                    "rms_norm_eps": 1e-6,
+                    "attention_bias": False,
+                    "attention_dropout": 0.0,
+                    "tie_word_embeddings": tie_word_embeddings,
                 },
-                "hidden_act": "silu",
-                "rms_norm_eps": 1e-6,
-                "attention_bias": False,
-                "attention_dropout": 0.0,
-                "tie_word_embeddings": tie_word_embeddings,
-            },
+            ),
         ),
     )
 
@@ -157,40 +175,42 @@ def qwen35_4b_config() -> Qwen35.Config:
       config: The 4B architecture with fused attention.
 
     """
-    return _cluster_attention(
-        _hf_projection_order(
-            Qwen35.Config.from_hf(
-                {
-                    "model_type": "qwen3_5_text",
-                    "vocab_size": 248_320,
-                    "hidden_size": 2_560,
-                    "intermediate_size": 9_216,
-                    "num_hidden_layers": 32,
-                    "num_attention_heads": 16,
-                    "num_key_value_heads": 4,
-                    "head_dim": 256,
-                    "linear_num_key_heads": 16,
-                    "linear_num_value_heads": 32,
-                    "linear_key_head_dim": 128,
-                    "linear_value_head_dim": 128,
-                    "linear_conv_kernel_dim": 4,
-                    "full_attention_interval": 4,
-                    "rope_parameters": {
-                        "rope_type": "default",
-                        "rope_theta": 10_000_000.0,
-                        "partial_rotary_factor": 0.25,
-                        "mrope_section": [11, 11, 10],
-                        "mrope_interleaved": True,
+    return _scoring_head(
+        _cluster_attention(
+            _hf_projection_order(
+                Qwen35.Config.from_hf(
+                    {
+                        "model_type": "qwen3_5_text",
+                        "vocab_size": 248_320,
+                        "hidden_size": 2_560,
+                        "intermediate_size": 9_216,
+                        "num_hidden_layers": 32,
+                        "num_attention_heads": 16,
+                        "num_key_value_heads": 4,
+                        "head_dim": 256,
+                        "linear_num_key_heads": 16,
+                        "linear_num_value_heads": 32,
+                        "linear_key_head_dim": 128,
+                        "linear_value_head_dim": 128,
+                        "linear_conv_kernel_dim": 4,
+                        "full_attention_interval": 4,
+                        "rope_parameters": {
+                            "rope_type": "default",
+                            "rope_theta": 10_000_000.0,
+                            "partial_rotary_factor": 0.25,
+                            "mrope_section": [11, 11, 10],
+                            "mrope_interleaved": True,
+                        },
+                        "hidden_act": "silu",
+                        "rms_norm_eps": 1e-6,
+                        "attention_bias": False,
+                        "attention_dropout": 0.0,
+                        "attn_output_gate": True,
+                        "initializer_range": 0.02,
+                        "max_position_embeddings": 262_144,
+                        "tie_word_embeddings": True,
                     },
-                    "hidden_act": "silu",
-                    "rms_norm_eps": 1e-6,
-                    "attention_bias": False,
-                    "attention_dropout": 0.0,
-                    "attn_output_gate": True,
-                    "initializer_range": 0.02,
-                    "max_position_embeddings": 262_144,
-                    "tie_word_embeddings": True,
-                },
+                ),
             ),
         ),
     )
@@ -333,8 +353,10 @@ class TMaxDPPOTrainStep(TrainStep):
         metadata: dict[str, object] | None = None
         if checkpoint is not None:
             metadata = _checkpoint_metadata(checkpoint)
-            staged_model = _cluster_attention(
-                _hf_projection_order(Qwen35.Config.from_hf(metadata)),
+            staged_model = _scoring_head(
+                _cluster_attention(
+                    _hf_projection_order(Qwen35.Config.from_hf(metadata)),
+                ),
             )
             # The published experiment spells the full architecture in its
             # config. Refuse a differently staged checkpoint instead of
