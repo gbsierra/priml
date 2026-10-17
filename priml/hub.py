@@ -347,7 +347,7 @@ def load_hf_checkpoint(
 def save_hf_checkpoint(
     path: Path | str,
     config: Mapping[str, object],
-    state: dict[str, Tensor],
+    state: Mapping[str, Tensor],
     *,
     auxiliary_files: Iterable[Path | str] = (),
 ) -> Path:

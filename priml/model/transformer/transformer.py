@@ -238,12 +238,14 @@ class Transformer(nn.Module):
         """Apply the head, or return hidden states when absent.
 
         Args:
-          hidden: Hidden.
-          output_projection: Optional replacement for the registered head call.
-          **kwargs: Kwargs.
+          hidden: Head-ready hidden states, ``[..., sequence, channels]``.
+          output_projection: Called as ``output_projection(head, hidden)`` in
+            place of the head; ``**kwargs`` are then not forwarded.
+          **kwargs: Messages forwarded to the head.
 
         Returns:
-          result: The Tensor.
+          result: The head's output, the projection's output, or ``hidden``
+            unchanged when there is no head.
 
         Raises:
           ValueError: ``output_projection`` is set but there is no head.

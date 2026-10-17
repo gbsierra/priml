@@ -256,19 +256,22 @@ class TiedLinear(nn.Module, LateBound):
         take ``weight.T`` as the ``[in, out]`` projection treat both alike.
 
         Raises:
-          RuntimeError: No ``make()`` has bound the source yet.
+          AttributeError: No ``make()`` has bound the source yet, so there is
+            no weight; ``has_weight`` reads this as absent.
 
         """
         if self._source is None:
-            raise RuntimeError(
-                f"TiedLinear is unbound; a make() must build the root holding "
-                f"{self.tied!r}.",
-            )
+            raise AttributeError(f"TiedLinear for {self.tied!r} is unbound.")
         return self._source.weight if self.transpose else self._source.weight.T
 
     @override
     def forward(self, x: Tensor, **kwargs: object) -> Tensor:
         del kwargs
+        if self._source is None:
+            raise RuntimeError(
+                f"TiedLinear is unbound; a make() must build the root holding "
+                f"{self.tied!r}.",
+            )
         if x.dtype.is_floating_point:
             return x @ self.weight.T
         return functional.embedding(x, self.weight.T)

@@ -292,6 +292,7 @@ class MultiProcess:
         self.float32_matmul_precision: Float32MatmulPrecision | None = (
             config.float32_matmul_precision
         )
+        _validate_process_group_timeout(config.process_group_timeout_sec)
         self.process_group_timeout_sec = config.process_group_timeout_sec
         _validate_mesh_topology(config.mesh_topology)
         self.mesh_topology = dict(config.mesh_topology)
@@ -382,12 +383,7 @@ def initialize_global_device_mesh(
     _process_group_owned = False
 
     # Validate before creating a process group that would need cleanup.
-    if process_group_timeout_sec is not None and (
-        math.isnan(process_group_timeout_sec)
-        or process_group_timeout_sec <= 0
-        or process_group_timeout_sec == math.inf
-    ):
-        raise ValueError("process_group_timeout_sec must be finite and greater than 0.")
+    _validate_process_group_timeout(process_group_timeout_sec)
     if not mesh_topology:
         raise ValueError(
             "mesh_topology cannot be empty. "
@@ -525,6 +521,14 @@ def _validate_mesh_topology(mesh_topology: dict[str, int]) -> None:
             "Mesh topology dimensions must be positive except for at most "
             f"one -1 (auto); got {mesh_topology}.",
         )
+
+
+def _validate_process_group_timeout(timeout_sec: float | None) -> None:
+    """Reject a timeout that is NaN, non-positive, or infinite."""
+    if timeout_sec is not None and (
+        math.isnan(timeout_sec) or timeout_sec <= 0 or timeout_sec == math.inf
+    ):
+        raise ValueError("process_group_timeout_sec must be finite and greater than 0.")
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)

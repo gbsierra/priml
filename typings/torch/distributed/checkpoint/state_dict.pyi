@@ -3,6 +3,7 @@ from dataclasses import dataclass
 
 from torch import Tensor, nn
 from torch.distributed.tensor import DTensor
+from torch.nn.modules.module import _IncompatibleKeys
 
 __all__ = ["StateDictOptions", "ValueType", "set_model_state_dict"]
 
@@ -25,4 +26,4 @@ def set_model_state_dict(
     model_state_dict: Mapping[str, ValueType],
     *,
     options: StateDictOptions | None = ...,
-) -> object: ...
+) -> _IncompatibleKeys: ...

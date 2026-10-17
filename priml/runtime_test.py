@@ -207,6 +207,22 @@ def test_multiprocess_rejects_invalid_process_group_timeout(
     assert "init_kwargs" not in record
 
 
+@pytest.mark.parametrize(
+    "timeout",
+    [0.0, -1.0, float("inf"), float("nan")],
+)
+def test_multiprocess_rejects_an_invalid_timeout_at_construction(
+    timeout: float,
+) -> None:
+    """A bad config field fails at ``make()``, before any ``initialize()``."""
+    with pytest.raises(ValueError, match="finite and greater than 0"):
+        MultiProcess.Config(
+            device="cpu",
+            mesh_topology={"dp": 1, "pp": 1, "tp": 1},
+            process_group_timeout_sec=timeout,
+        ).make()
+
+
 def test_explicit_timeout_rejects_preexisting_process_group(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

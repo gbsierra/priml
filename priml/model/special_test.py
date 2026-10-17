@@ -321,9 +321,17 @@ def test_tied_linear_exposes_the_borrowed_weight_in_linear_layout() -> None:
 
 
 def test_an_unbound_tied_linear_has_no_weight() -> None:
+    """Unbound means no weight: ``has_weight`` answers False instead of raising."""
+    head = TiedLinear(TiedLinear.Config(tied="embed"))
+    assert not has_weight(head)
+    with pytest.raises(AttributeError):
+        _ = head.weight
+
+
+def test_an_unbound_tied_linear_refuses_to_run() -> None:
     head = TiedLinear(TiedLinear.Config(tied="embed"))
     with pytest.raises(RuntimeError, match="unbound"):
-        _ = head.weight
+        head(torch.randn(2, 3))
 
 
 def test_tied_linear_rejects_a_source_without_a_weight() -> None:
