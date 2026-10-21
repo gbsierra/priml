@@ -123,7 +123,7 @@ def test_smoke_fixture_packs_through_the_data_source() -> None:
     assert len(batches) == 1
     rows = cast(tuple[dict[str, object], ...], batches[0]["rows"])
     assert len(rows) == 1
-    assert int(cast(int, batches[0]["response_token_count"])) > 0
+    assert cast(int, batches[0]["response_token_count"]) > 0
     response_mask = cast(torch.Tensor, rows[0]["response_mask"])
     assert int(response_mask[1:].bool().sum()) > 0
     # Both rollouts are in one row, so the row holds two attention segments.

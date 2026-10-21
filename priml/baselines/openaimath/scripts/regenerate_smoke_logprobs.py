@@ -58,9 +58,9 @@ def _read_records() -> list[dict[str, object]]:
     return sorted(
         records,
         key=lambda record: (
-            int(cast(int, record["step"])),
-            int(cast(int, record["prompt_idx"])),
-            int(cast(int, record["sample_idx"])),
+            cast(int, record["step"]),
+            cast(int, record["prompt_idx"]),
+            cast(int, record["sample_idx"]),
         ),
     )
 
@@ -96,7 +96,7 @@ def _scores(step: TMaxDPPOTrainStep, row: dict[str, object]) -> Tensor:
 
 def _record_positions(row: dict[str, object], record: dict[str, object]) -> Tensor:
     """Find this record's response tokens in a packed row."""
-    sample = int(cast(int, record["sample_idx"]))
+    sample = cast(int, record["sample_idx"])
     positions = (_tensor(row, "rollout_sample_ids") == sample) & (
         _tensor(row, "response_mask") != 0
     )

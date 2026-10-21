@@ -71,7 +71,7 @@ class _CharTokenizer:
 
     def decode(self, token_ids: Sequence[int]) -> str:
         """Decode one token per character."""
-        return "".join(chr(int(token) - 1) for token in token_ids)
+        return "".join(chr(token - 1) for token in token_ids)
 
 
 def _sampled(text: str, *, finish_reason: str = "stop") -> SampledTokens:

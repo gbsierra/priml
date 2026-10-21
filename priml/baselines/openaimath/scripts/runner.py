@@ -217,9 +217,9 @@ class TaskStore:
     def load_state_dict(self, state_dict: Mapping[str, object]) -> None:
         """Restore a cursor written by :meth:`state_dict`."""
         if "seed" in state_dict:
-            self.seed = int(cast(int, state_dict["seed"]))
-        self._epoch = int(cast(int, state_dict.get("epoch", 0)))
-        self._position = int(cast(int, state_dict.get("position", 0)))
+            self.seed = cast(int, state_dict["seed"])
+        self._epoch = cast(int, state_dict.get("epoch", 0))
+        self._position = cast(int, state_dict.get("position", 0))
         self._order = self._shuffled(self._epoch)
         if self._position > len(self._order):
             raise ValueError(
@@ -526,7 +526,7 @@ class OpenMathRolloutRunner:
             )
         self.working_dir = Path(cast("Path | str", config.working_dir))
         self.output_dir = Path(cast("Path | str", config.output_dir))
-        self.num_updates = int(cast(int, config.num_updates))
+        self.num_updates = cast(int, config.num_updates)
         if self.num_updates <= 0:
             raise ValueError("num_updates must be positive.")
         if config.start_step < 0:

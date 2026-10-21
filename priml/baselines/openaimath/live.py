@@ -246,7 +246,7 @@ class LiveOpenMathRolloutData(OpenMathRolloutData):
         ]
         if torch.distributed.is_initialized():
             torch.distributed.broadcast_object_list(frontier, src=0)
-        self._first_missing_step = int(cast(int, frontier[0]))
+        self._first_missing_step = cast(int, frontier[0])
         # The policy must be served before the first episode samples it, on a
         # fresh run as well as a resumed one, so the initial sync is the first
         # thing that happens after the learner's checkpoint is restored.
@@ -395,7 +395,7 @@ class LiveOpenMathRolloutData(OpenMathRolloutData):
     def load_state_dict(self, state_dict: Mapping[str, object]) -> None:
         """Restore the cursor after the learner checkpoint is loaded."""
         super().load_state_dict(state_dict)
-        self._next_step = int(cast(int, state_dict.get("next_step", 0)))
+        self._next_step = cast(int, state_dict.get("next_step", 0))
         cursor = state_dict.get("task_cursor")
         self._task_cursor = (
             cast(Mapping[str, object], cursor) if isinstance(cursor, Mapping) else None

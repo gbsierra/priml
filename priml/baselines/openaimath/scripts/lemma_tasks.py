@@ -418,7 +418,8 @@ def _lemma_at(  # noqa: PLR0917 -- One command's context, passed whole.
         return None
     name = re.sub(r"\.\{[^}]*\}$", "", match.group("name"))
     if name.startswith("_root_."):
-        name, namespace = name.removeprefix("_root_."), []
+        name = name.removeprefix("_root_.")
+        namespace = cast(list[str], [])
     else:
         namespace = [part for kind, part in scopes if kind == "namespace"]
     if not _IDENTIFIER.fullmatch(name):

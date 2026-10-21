@@ -101,7 +101,7 @@ class TransformersTokenizer:
                 {"role": "user", "content": after},
             ],
         )
-        end_of_turn = str(self._tokenizer.eos_token or "")
+        end_of_turn = self._tokenizer.eos_token or ""
         between = exchange.partition(reply)[2].partition(after)[0]
         if (
             not found
@@ -169,9 +169,7 @@ class TransformersTokenizer:
           text: Decoded text.
 
         """
-        return str(
-            self._tokenizer.decode(list(token_ids), skip_special_tokens=False),
-        )
+        return self._tokenizer.decode(list(token_ids), skip_special_tokens=False)
 
 
 def completion_request(  # noqa: PLR0917 -- One field per sampling parameter the request pins.
@@ -207,7 +205,7 @@ def completion_request(  # noqa: PLR0917 -- One field per sampling parameter the
     payload: dict[str, object] = {
         "model": model,
         "prompt": list(prompt_tokens),
-        "max_tokens": int(max_tokens),
+        "max_tokens": max_tokens,
         "temperature": temperature,
         "top_p": top_p,
         "logprobs": 1,
